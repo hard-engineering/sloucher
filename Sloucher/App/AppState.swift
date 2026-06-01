@@ -1,0 +1,1078 @@
+import AppKit
+import AVFoundation
+import Combine
+import CoreImage
+import Foundation
+
+final class AppState: ObservableObject {
+    @Published var settings = SettingsStore()
+    @Published private(set) var status: PostureStatus = .uncalibrated {
+        didSet {
+            guard status != oldValue else { return }
+            statusChangedAt = Date()
+        }
+    }
+    @Published private(set) var statusChangedAt = Date()
+    @Published private(set) var latestMetrics: PostureMetrics?
+    @Published private(set) var latestPose: PoseFrame?
+    @Published private(set) var latestFrameImage: CGImage?
+    @Published private(set) var lastFrameDiagnostics: PostureFrameDiagnostics = .empty
+    @Published private(set) var metricHistory: [MetricHistorySample] = []
+    @Published private(set) var postureScore: Int?
+    @Published private(set) var inspectorVisible = false
+    @Published private(set) var isNudgePreviewActive = false
+    @Published private(set) var calibrationBodySamples = 0
+    @Published private(set) var calibrationRequiredSamples = 6
+    @Published private(set) var calibrationFrameCount = 0
+    @Published private(set) var calibrationLastIssue: String?
+    @Published private(set) var detailText: String?
+    @Published var launchAtLoginEnabled: Bool = false {
+        didSet {
+            guard launchAtLoginEnabled != loginItemManager.isEnabled else { return }
+            do {
+                try loginItemManager.setEnabled(launchAtLoginEnabled)
+            } catch {
+                detailText = "Launch at login failed: \(error.localizedDescription)"
+                launchAtLoginEnabled = loginItemManager.isEnabled
+            }
+        }
+    }
+
+    private let cameraController = CameraController()
+    private let postureAnalyzer = PostureAnalyzer()
+    private let calibrator = Calibrator()
+    private let nudger = Nudger()
+    private let powerManager = PowerManager()
+    private let loginItemManager = LoginItemManager()
+    private let runtimeDefaults = UserDefaults.standard
+    private let analysisQueue = DispatchQueue(label: "app.sloucher.analysis", qos: .utility)
+    private let imageContext = CIContext(options: [.cacheIntermediates: false])
+    private var cancellables: Set<AnyCancellable> = []
+    private var isManuallyPaused = false
+    private var isPowerPaused = false
+    private var powerPauseReason: String?
+    private var snoozeUntil: Date?
+    private var smoothedScore: Double?
+    private var lastScoreUpdateAt: Date?
+    private var recentBodyCalibrationMetrics: [PostureMetrics] = []
+    private var calibrationFrames = 0
+    private var calibrationBodySuccesses = 0
+    private var calibrationBodyObservationTotal = 0
+    private var calibrationValidBodyCandidateTotal = 0
+    private var calibrationFaceDetectedFrames = 0
+    private var calibrationDebugOrientationSweeps: [PostureOrientationSweepDiagnostics] = []
+
+    var hasBaseline: Bool {
+        settings.baseline?.hasBodyBaseline == true
+    }
+
+    var canCalibrate: Bool {
+        status != .cameraDenied && status != .cameraUnavailable && status != .calibrating
+    }
+
+    var isPaused: Bool {
+        isManuallyPaused
+    }
+
+    var displayBaselineDistance: Double? {
+        guard let baseline = settings.baseline, baseline.hasBodyBaseline else { return nil }
+        return baseline.neckDistance
+    }
+
+    var liveMetrics: PostureMetrics? {
+        status == .cannotSee ? nil : latestMetrics
+    }
+
+    var slouchThreshold: Double? {
+        displayBaselineDistance.map { $0 * (1 - settings.decisionConfig.dropThreshold) }
+    }
+
+    var displayClosenessThreshold: Double {
+        settings.decisionConfig.closenessThreshold
+    }
+
+    var isLeanSignalCurrentlyTriggering: Bool {
+        guard status != .cannotSee, let metrics = liveMetrics else { return false }
+
+        guard let baseline = settings.baseline, metrics.source == .body else { return false }
+
+        return (metrics.closeness > displayClosenessThreshold &&
+            metrics.neckDistance < baseline.neckDistance * 0.98) ||
+            (metrics.closeness > displayClosenessThreshold + 0.12 &&
+                metrics.neckDistance < baseline.neckDistance * 1.02)
+    }
+
+    var baselineHeadY: Double? {
+        guard let baseline = settings.baseline, baseline.hasBodyBaseline else { return nil }
+
+        guard
+            let shoulderMidY = latestPose?.shoulderMidY,
+            let shoulderWidth = latestPose?.shoulderWidth
+        else {
+            return nil
+        }
+
+        return shoulderMidY + baseline.neckDistance * shoulderWidth
+    }
+
+    var currentDropPercent: Double? {
+        guard
+            let metrics = latestMetrics,
+            let baseline = displayBaselineDistance,
+            status != .cannotSee,
+            baseline > 0
+        else {
+            return nil
+        }
+
+        return (baseline - metrics.neckDistance) / baseline * 100
+    }
+
+    var samplingRateText: String {
+        if calibrator.isCollecting || inspectorVisible {
+            return "15 Hz"
+        }
+
+        let rate = 1 / max(0.1, powerManager.currentSampleInterval)
+        return "\(rate.formatted(.number.precision(.fractionLength(1)))) Hz"
+    }
+
+    var statusBadgeText: String {
+        switch status {
+        case .good:
+            "Good posture"
+        case .slouching:
+            "Slouching"
+        case .calibrating:
+            "Calibrating..."
+        case .cannotSee:
+            lastFrameDiagnostics.faceDetected ? "Need shoulders" : "Need better view"
+        case .uncalibrated:
+            "Needs calibration"
+        default:
+            status.displayName
+        }
+    }
+
+    var inspectorGuidanceText: String? {
+        if status == .calibrating {
+            if calibrationBodySamples == 0 {
+                let issue = calibrationLastIssue.map { " \($0)" } ?? ""
+                return "Finding a stable shoulder line - checked \(calibrationFrameCount) frames.\(issue)"
+            }
+
+            let issue = calibrationLastIssue.map { " \($0)" } ?? ""
+            return "Hold still - collected \(calibrationBodySamples)/\(calibrationRequiredSamples) shoulder samples across \(calibrationFrameCount) frames.\(issue)"
+        }
+
+        if !hasBaseline {
+            return detailText ?? "Click Calibrate once your head and both shoulders are visible."
+        }
+
+        if status == .cannotSee {
+            return Self.trackingGuidance(
+                faceDetected: lastFrameDiagnostics.faceDetected,
+                detail: lastFrameDiagnostics.bodyFailureReason ?? detailText
+            )
+        }
+
+        return nil
+    }
+
+    init() {
+        if settings.baseline?.hasBodyBaseline != true {
+            settings.clearBaseline()
+        }
+        postureAnalyzer.baseline = settings.baseline
+        launchAtLoginEnabled = loginItemManager.isEnabled
+        // Seeded calibration is no longer used; clear old counters at launch
+        // so diagnostics do not imply a stale shortcut path is active.
+        runtimeDefaults.set(0, forKey: RuntimeKeys.calibrationSeedCandidates)
+        runtimeDefaults.set(0, forKey: RuntimeKeys.calibrationSeedAccepted)
+        configureServices()
+        configureSettingsObservation()
+        requestPermissionsAndStart()
+    }
+
+    func startCalibration() {
+        let requiredSamples = 6
+        if settings.baseline?.hasBodyBaseline != true {
+            settings.clearBaseline()
+        }
+        detailText = "Sit upright for 2 seconds."
+        status = .calibrating
+        calibrationBodySamples = 0
+        calibrationRequiredSamples = requiredSamples
+        calibrationFrameCount = 0
+        calibrationLastIssue = nil
+        postureScore = nil
+        smoothedScore = nil
+        lastScoreUpdateAt = nil
+        metricHistory = []
+        runtimeDefaults.set(0, forKey: RuntimeKeys.calibrationBodySamples)
+        runtimeDefaults.set(0, forKey: RuntimeKeys.calibrationFrames)
+        runtimeDefaults.set(0, forKey: RuntimeKeys.calibrationBodySuccesses)
+        runtimeDefaults.set(0, forKey: RuntimeKeys.calibrationRejectedSamples)
+        runtimeDefaults.removeObject(forKey: RuntimeKeys.calibrationLastFailure)
+        runtimeDefaults.removeObject(forKey: RuntimeKeys.calibrationLastRejectReason)
+        publishRuntimeDiagnostics(status: status, detail: detailText, metrics: latestMetrics)
+        nudger.clear()
+
+        analysisQueue.sync {
+            // Recalibration must describe the user's current camera framing.
+            // Reusing recent samples can silently skip live collection and hide
+            // body-pose failures, so every calibration starts from empty samples.
+            calibrator.start(duration: 2, minimumSamples: requiredSamples)
+            calibrationFrames = 0
+            calibrationBodySuccesses = 0
+            calibrationBodyObservationTotal = 0
+            calibrationValidBodyCandidateTotal = 0
+            calibrationFaceDetectedFrames = 0
+            calibrationDebugOrientationSweeps = []
+            postureAnalyzer.resetCalibrationDebugDiagnostics()
+            runtimeDefaults.set(0, forKey: RuntimeKeys.calibrationSeedCandidates)
+            runtimeDefaults.set(0, forKey: RuntimeKeys.calibrationSeedAccepted)
+            runtimeDefaults.set(0, forKey: RuntimeKeys.calibrationRejectedSamples)
+            runtimeDefaults.set(0, forKey: RuntimeKeys.calibrationBodyObservationTotal)
+            runtimeDefaults.set(0, forKey: RuntimeKeys.calibrationValidBodyCandidateTotal)
+            runtimeDefaults.set(0, forKey: RuntimeKeys.calibrationFaceDetectedFrames)
+            runtimeDefaults.removeObject(forKey: RuntimeKeys.calibrationDebugOrientationSweeps)
+            runtimeDefaults.removeObject(forKey: RuntimeKeys.calibrationDebugBestOrientation)
+        }
+
+        calibrationBodySamples = 0
+
+        cameraController.forceNextFrame()
+        cameraController.start()
+    }
+
+    func togglePause() {
+        if isManuallyPaused {
+            isManuallyPaused = false
+            status = hasBaseline ? .good : .uncalibrated
+            detailText = nil
+            publishRuntimeDiagnostics(status: status, detail: detailText, metrics: latestMetrics)
+            if !isPowerPaused {
+                cameraController.start()
+            }
+        } else {
+            isManuallyPaused = true
+            status = .paused
+            detailText = "Monitoring is paused."
+            publishRuntimeDiagnostics(status: status, detail: detailText, metrics: latestMetrics)
+            nudger.clear()
+            cameraController.stop()
+        }
+    }
+
+    func snooze(minutes: Int) {
+        snoozeUntil = Date().addingTimeInterval(TimeInterval(minutes * 60))
+        status = .snoozed
+        detailText = "Monitoring resumes at \(snoozeUntil!.formatted(date: .omitted, time: .shortened))."
+        publishRuntimeDiagnostics(status: status, detail: detailText, metrics: latestMetrics)
+        nudger.clear()
+        cameraController.stop()
+    }
+
+    func testNudge() {
+        detailText = "Testing notification, sound, and glow."
+        isNudgePreviewActive = true
+        publishRuntimeDiagnostics(status: status, detail: detailText, metrics: latestMetrics)
+
+        nudger.update(
+            status: .slouching,
+            notificationsEnabled: settings.notificationsEnabled,
+            soundEnabled: settings.soundEnabled,
+            overlayEnabled: settings.overlayEnabled
+        )
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+            guard let self else { return }
+            self.isNudgePreviewActive = false
+            guard self.status != .slouching else { return }
+            self.nudger.clear()
+            self.detailText = self.hasBaseline ? nil : "Calibrate once while sitting upright."
+            self.publishRuntimeDiagnostics(status: self.status, detail: self.detailText, metrics: self.latestMetrics)
+        }
+    }
+
+    func setInspectorVisible(_ visible: Bool) {
+        guard inspectorVisible != visible else {
+            if visible {
+                cameraController.forceNextFrame()
+            }
+            return
+        }
+
+        inspectorVisible = visible
+        cameraController.forceNextFrame()
+
+        if visible {
+            guard
+                !isManuallyPaused,
+                status != .snoozed,
+                status != .cameraDenied,
+                status != .cameraUnavailable
+            else {
+                return
+            }
+
+            cameraController.start()
+        } else if isPowerPaused && !isManuallyPaused && status != .snoozed {
+            cameraController.stop()
+            nudger.clear()
+            status = .paused
+            detailText = powerPauseReason
+            publishRuntimeDiagnostics(status: status, detail: detailText, metrics: latestMetrics)
+        }
+    }
+
+    func openCameraSettings() {
+        guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Camera") else {
+            return
+        }
+
+        NSWorkspace.shared.open(url)
+    }
+
+    func quit() {
+        cameraController.stop()
+        nudger.clear()
+        NSApp.terminate(nil)
+    }
+
+    private func configureServices() {
+        cameraController.sampleIntervalProvider = { [weak self] in
+            guard let self else { return 1.5 }
+            if self.calibrator.isCollecting {
+                return 1.0 / 15.0
+            }
+            if self.inspectorVisible {
+                return 1.0 / 15.0
+            }
+            return self.powerManager.currentSampleInterval
+        }
+
+        cameraController.onFrame = { [weak self] sampleBuffer in
+            self?.processFrame(sampleBuffer)
+        }
+
+        cameraController.onAuthorizationChange = { [weak self] authorization in
+            DispatchQueue.main.async {
+                self?.applyCameraAuthorization(authorization)
+            }
+        }
+
+        powerManager.onCaptureDesiredChange = { [weak self] shouldCapture, reason in
+            DispatchQueue.main.async {
+                self?.applyPowerCapturePreference(shouldCapture: shouldCapture, reason: reason)
+            }
+        }
+
+        powerManager.start()
+    }
+
+    private func configureSettingsObservation() {
+        settings.objectWillChange
+            .sink { [weak self] _ in
+                DispatchQueue.main.async {
+                    self?.objectWillChange.send()
+                }
+            }
+            .store(in: &cancellables)
+
+        settings.$baseline
+            .sink { [weak self] baseline in
+                self?.analysisQueue.async {
+                    self?.postureAnalyzer.baseline = baseline
+                }
+            }
+            .store(in: &cancellables)
+    }
+
+    private func requestPermissionsAndStart() {
+        nudger.requestAuthorization()
+        cameraController.requestAuthorizationAndConfigure()
+    }
+
+    private func processFrame(_ sampleBuffer: CMSampleBuffer) {
+        analysisQueue.async { [weak self] in
+            guard let self else { return }
+            let forceInference = self.calibrator.isCollecting || self.inspectorVisible
+            let frameImage = self.makeFrameImage(from: sampleBuffer)
+            let result = self.postureAnalyzer.analyze(
+                sampleBuffer: sampleBuffer,
+                config: self.settings.decisionConfig,
+                forceInference: forceInference,
+                collectCalibrationDiagnostics: self.calibrator.isCollecting
+            )
+            let frameDiagnostics = self.postureAnalyzer.lastFrameDiagnostics
+            self.publishFrameDiagnostics(frameDiagnostics, result: result)
+
+            if let metrics = result.metrics, metrics.source == .body {
+                self.rememberBodyCalibrationMetric(metrics)
+            }
+
+            var completedCalibration: PostureBaseline?
+            var calibrationMetrics = result.metrics
+            var calibrationSampleCount: Int?
+            let requiredSampleCount = self.calibrator.requiredSampleCount
+
+            if self.calibrator.isCollecting {
+                self.calibrationFrames += 1
+                // Keep aggregate Vision counts so a later successful calibration
+                // does not erase whether failures were "no body observations" or
+                // "body observations rejected by our filters."
+                self.calibrationBodyObservationTotal += frameDiagnostics.bodyObservationCount
+                self.calibrationValidBodyCandidateTotal += frameDiagnostics.validBodyCandidateCount
+                if frameDiagnostics.faceDetected {
+                    self.calibrationFaceDetectedFrames += 1
+                }
+
+                if result.metrics?.source == .body {
+                    self.calibrationBodySuccesses += 1
+                }
+
+                if let metrics = result.metrics {
+                    completedCalibration = self.calibrator.add(metrics: metrics)
+                }
+
+                if completedCalibration == nil {
+                    completedCalibration = self.calibrator.finishIfReady()
+                    calibrationMetrics = calibrationMetrics ?? self.calibrator.latestSample
+                }
+
+                calibrationSampleCount = self.calibrator.bodySampleCount
+                self.runtimeDefaults.set(calibrationSampleCount ?? 0, forKey: RuntimeKeys.calibrationBodySamples)
+                self.runtimeDefaults.set(self.calibrationFrames, forKey: RuntimeKeys.calibrationFrames)
+                self.runtimeDefaults.set(self.calibrationBodySuccesses, forKey: RuntimeKeys.calibrationBodySuccesses)
+                self.runtimeDefaults.set(self.calibrator.rejectedSampleCount, forKey: RuntimeKeys.calibrationRejectedSamples)
+                self.runtimeDefaults.set(frameDiagnostics.bodyObservationCount, forKey: RuntimeKeys.calibrationBodyObservationCount)
+                self.runtimeDefaults.set(frameDiagnostics.validBodyCandidateCount, forKey: RuntimeKeys.calibrationValidBodyCandidateCount)
+                self.runtimeDefaults.set(frameDiagnostics.faceDetected, forKey: RuntimeKeys.calibrationFaceDetected)
+                self.runtimeDefaults.set(self.calibrationBodyObservationTotal, forKey: RuntimeKeys.calibrationBodyObservationTotal)
+                self.runtimeDefaults.set(self.calibrationValidBodyCandidateTotal, forKey: RuntimeKeys.calibrationValidBodyCandidateTotal)
+                self.runtimeDefaults.set(self.calibrationFaceDetectedFrames, forKey: RuntimeKeys.calibrationFaceDetectedFrames)
+                self.setRuntime(frameDiagnostics.candidateConfidence, forKey: RuntimeKeys.calibrationLastCandidateConfidence)
+                self.setRuntime(frameDiagnostics.candidateShoulderWidth, forKey: RuntimeKeys.calibrationLastCandidateShoulderWidth)
+                self.setRuntime(frameDiagnostics.candidateNeckDistance, forKey: RuntimeKeys.calibrationLastCandidateNeckDistance)
+                self.setRuntime(frameDiagnostics.bestCandidateScore, forKey: RuntimeKeys.calibrationLastCandidateScore)
+                self.setRuntime(frameDiagnostics.headAnchorSource, forKey: RuntimeKeys.calibrationHeadAnchorSource)
+
+                if !frameDiagnostics.orientationSweepResults.isEmpty {
+                    // Store every tested orientation for a few failing calibration
+                    // frames. The best orientation is only a quick summary; the
+                    // full sweep is the evidence for or against an orientation bug.
+                    let sweep = PostureOrientationSweepDiagnostics(
+                        frame: self.calibrationFrames,
+                        timestamp: Date(),
+                        results: frameDiagnostics.orientationSweepResults,
+                        bestOrientation: Self.bestOrientationName(in: frameDiagnostics.orientationSweepResults)
+                    )
+                    self.calibrationDebugOrientationSweeps.append(sweep)
+                    self.calibrationDebugOrientationSweeps = Array(self.calibrationDebugOrientationSweeps.suffix(3))
+                    self.publishCalibrationDebugOrientationSweeps()
+                }
+
+                self.setRuntime(result.reason, forKey: RuntimeKeys.calibrationLastFailure)
+                self.setRuntime(frameDiagnostics.bodyFailureReason, forKey: RuntimeKeys.calibrationLastBodyFailure)
+                self.setRuntime(self.calibrator.lastRejectReason, forKey: RuntimeKeys.calibrationLastRejectReason)
+
+                let rawIssue = self.calibrator.lastRejectReason ??
+                    result.reason ??
+                    frameDiagnostics.bodyFailureReason
+                let issue = rawIssue.map {
+                    Self.trackingGuidance(faceDetected: frameDiagnostics.faceDetected, detail: $0)
+                }
+                let frameCount = self.calibrationFrames
+
+                DispatchQueue.main.async {
+                    self.calibrationBodySamples = calibrationSampleCount ?? 0
+                    self.calibrationRequiredSamples = requiredSampleCount
+                    self.calibrationFrameCount = frameCount
+                    self.calibrationLastIssue = issue
+                }
+            }
+
+            if let baseline = completedCalibration {
+                self.postureAnalyzer.baseline = baseline
+                let sampleCount = calibrationSampleCount ?? self.calibrator.bodySampleCount
+                let frameCount = self.calibrationFrames
+                let rejectedSampleCount = self.calibrator.rejectedSampleCount
+                self.publishCalibrationAttemptSnapshot(
+                    prefix: RuntimeKeys.calibrationLastAttemptPrefix,
+                    status: "succeeded",
+                    bodySamples: sampleCount,
+                    bodySuccesses: self.calibrationBodySuccesses,
+                    frames: frameCount,
+                    rejectedSamples: rejectedSampleCount,
+                    reason: nil
+                )
+                self.publishCalibrationAttemptSnapshot(
+                    prefix: RuntimeKeys.calibrationLastSucceededPrefix,
+                    status: "succeeded",
+                    bodySamples: sampleCount,
+                    bodySuccesses: self.calibrationBodySuccesses,
+                    frames: frameCount,
+                    rejectedSamples: rejectedSampleCount,
+                    reason: nil
+                )
+
+                DispatchQueue.main.async {
+                    self.settings.baseline = baseline
+                    self.status = .good
+                    self.detailText = "Calibrated."
+
+                    if let calibrationMetrics {
+                        self.updatePostureScore(with: calibrationMetrics, status: .good)
+                        self.latestMetrics = calibrationMetrics
+                    }
+
+                    self.latestPose = result.pose
+                    self.latestFrameImage = frameImage
+                    self.lastFrameDiagnostics = frameDiagnostics
+                    self.metricHistory = []
+                    self.calibrationBodySamples = sampleCount
+                    self.calibrationFrameCount = frameCount
+                    self.calibrationLastIssue = nil
+                    self.runtimeDefaults.set(sampleCount, forKey: RuntimeKeys.calibrationBodySamples)
+                    self.runtimeDefaults.removeObject(forKey: RuntimeKeys.calibrationLastFailure)
+                    self.publishRuntimeDiagnostics(
+                        status: self.status,
+                        detail: self.detailText,
+                        metrics: calibrationMetrics ?? self.latestMetrics
+                    )
+                    self.cameraController.forceNextFrame()
+                }
+
+                return
+            }
+
+            if self.calibrator.hasTimedOut(collectionTimeout: 7, noSampleTimeout: 12) {
+                let bodySampleCount = self.calibrator.bodySampleCount
+                let rejectedSampleCount = self.calibrator.rejectedSampleCount
+                let lastRejectReason = self.calibrator.lastRejectReason
+                let frameCount = self.calibrationFrames
+                let bodySuccessCount = self.calibrationBodySuccesses
+                let lastIssue = lastRejectReason ?? self.runtimeDefaults.string(forKey: RuntimeKeys.calibrationLastBodyFailure)
+                let guidance = lastIssue.map {
+                    Self.trackingGuidance(faceDetected: frameDiagnostics.faceDetected, detail: $0)
+                }
+                self.publishCalibrationAttemptSnapshot(
+                    prefix: RuntimeKeys.calibrationLastAttemptPrefix,
+                    status: "failed",
+                    bodySamples: bodySampleCount,
+                    bodySuccesses: bodySuccessCount,
+                    frames: frameCount,
+                    rejectedSamples: rejectedSampleCount,
+                    reason: guidance
+                )
+                self.publishCalibrationAttemptSnapshot(
+                    prefix: RuntimeKeys.calibrationLastFailedPrefix,
+                    status: "failed",
+                    bodySamples: bodySampleCount,
+                    bodySuccesses: bodySuccessCount,
+                    frames: frameCount,
+                    rejectedSamples: rejectedSampleCount,
+                    reason: guidance
+                )
+                self.calibrator.cancel()
+                DispatchQueue.main.async {
+                    self.status = self.hasBaseline ? .good : .cannotSee
+                    self.detailText = Self.calibrationFailureMessage(
+                        bodySamples: bodySampleCount,
+                        bodySuccesses: bodySuccessCount,
+                        frames: frameCount,
+                        lastIssue: guidance
+                    )
+                    self.calibrationBodySamples = bodySampleCount
+                    self.calibrationFrameCount = frameCount
+                    self.calibrationLastIssue = guidance
+                    self.postureScore = nil
+                    self.lastFrameDiagnostics = frameDiagnostics
+                    self.runtimeDefaults.set(
+                        bodySampleCount,
+                        forKey: RuntimeKeys.calibrationBodySamples
+                    )
+                    self.runtimeDefaults.set(frameCount, forKey: RuntimeKeys.calibrationFrames)
+                    self.runtimeDefaults.set(bodySuccessCount, forKey: RuntimeKeys.calibrationBodySuccesses)
+                    self.runtimeDefaults.set(rejectedSampleCount, forKey: RuntimeKeys.calibrationRejectedSamples)
+                    self.publishRuntimeDiagnostics(status: self.status, detail: self.detailText, metrics: self.latestMetrics)
+                    self.cameraController.forceNextFrame()
+                }
+                return
+            }
+
+            DispatchQueue.main.async {
+                self.latestFrameImage = frameImage
+                self.lastFrameDiagnostics = frameDiagnostics
+                self.applyAnalysisResult(result)
+            }
+        }
+    }
+
+    private func applyAnalysisResult(_ result: PostureAnalysisResult) {
+        guard !isManuallyPaused && (!isPowerPaused || inspectorVisible) && status != .calibrating else {
+            if let metrics = result.metrics {
+                latestMetrics = metrics
+            }
+            if let pose = result.pose {
+                latestPose = pose
+            }
+            return
+        }
+
+        if let snoozeUntil {
+            if Date() < snoozeUntil {
+                status = .snoozed
+                return
+            }
+            self.snoozeUntil = nil
+            cameraController.start()
+        }
+
+        let nextStatus = hasBaseline ? result.status : .uncalibrated
+        if let metrics = result.metrics {
+            latestMetrics = metrics
+        } else if nextStatus == .cannotSee {
+            latestMetrics = nil
+        }
+        if let pose = result.pose {
+            latestPose = pose
+        } else if nextStatus == .cannotSee {
+            latestPose = nil
+        }
+
+        status = nextStatus
+        if nextStatus == .cannotSee || result.metrics == nil, let reason = result.reason {
+            detailText = Self.trackingGuidance(
+                faceDetected: lastFrameDiagnostics.faceDetected,
+                detail: lastFrameDiagnostics.bodyFailureReason ?? reason
+            )
+        } else if hasBaseline {
+            detailText = result.reason
+        } else if let reason = result.reason {
+            detailText = Self.trackingGuidance(
+                faceDetected: lastFrameDiagnostics.faceDetected,
+                detail: lastFrameDiagnostics.bodyFailureReason ?? reason
+            )
+        } else if detailText?.hasPrefix("Couldn't calibrate.") == true {
+            // Preserve actionable calibration failure guidance until the next attempt.
+        } else {
+            detailText = "Click Calibrate once your head and both shoulders are visible."
+        }
+
+        if let metrics = result.metrics {
+            updatePostureScore(with: metrics, status: nextStatus)
+            recordHistory(metrics: metrics, status: nextStatus)
+        } else if nextStatus == .cannotSee || nextStatus == .uncalibrated {
+            postureScore = nil
+        }
+
+        publishRuntimeDiagnostics(status: nextStatus, detail: detailText, metrics: liveMetrics)
+
+        nudger.update(
+            status: nextStatus,
+            notificationsEnabled: settings.notificationsEnabled,
+            soundEnabled: settings.soundEnabled,
+            overlayEnabled: settings.overlayEnabled
+        )
+    }
+
+    private func applyCameraAuthorization(_ authorization: CameraAuthorization) {
+        switch authorization {
+        case .authorized:
+            status = hasBaseline ? .good : .uncalibrated
+            detailText = hasBaseline ? nil : "Calibrate once while sitting upright."
+            publishRuntimeDiagnostics(status: status, detail: detailText, metrics: latestMetrics)
+            showCalibrationHintIfNeeded()
+            cameraController.start()
+        case .denied:
+            status = .cameraDenied
+            detailText = "Allow camera access in System Settings."
+            postureScore = nil
+            publishRuntimeDiagnostics(status: status, detail: detailText, metrics: latestMetrics)
+        case .unavailable:
+            status = .cameraUnavailable
+            detailText = "No video camera was found."
+            postureScore = nil
+            publishRuntimeDiagnostics(status: status, detail: detailText, metrics: latestMetrics)
+        }
+    }
+
+    private func applyPowerCapturePreference(shouldCapture: Bool, reason: String?) {
+        isPowerPaused = !shouldCapture
+        powerPauseReason = reason
+
+        if shouldCapture {
+            guard !isManuallyPaused && status != .snoozed else { return }
+            cameraController.start()
+            status = hasBaseline ? .good : .uncalibrated
+            detailText = nil
+            publishRuntimeDiagnostics(status: status, detail: detailText, metrics: latestMetrics)
+        } else {
+            guard !inspectorVisible else { return }
+            cameraController.stop()
+            nudger.clear()
+            if !isManuallyPaused && status != .snoozed {
+                status = .paused
+                detailText = reason
+                publishRuntimeDiagnostics(status: status, detail: detailText, metrics: latestMetrics)
+            }
+        }
+    }
+
+    private func makeFrameImage(from sampleBuffer: CMSampleBuffer) -> CGImage? {
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
+            return nil
+        }
+
+        let image = CIImage(cvPixelBuffer: pixelBuffer)
+        return imageContext.createCGImage(image, from: image.extent)
+    }
+
+    private func updatePostureScore(with metrics: PostureMetrics, status: PostureStatus) {
+        guard
+            status != .calibrating,
+            status != .cannotSee,
+            let baseline = displayBaselineDistance,
+            baseline.isFinite,
+            baseline > 0
+        else {
+            postureScore = nil
+            smoothedScore = nil
+            lastScoreUpdateAt = nil
+            return
+        }
+
+        let dropFraction = max(0, (baseline - metrics.neckDistance) / baseline)
+        let leanFraction = max(0, metrics.closeness - 1)
+        let penalty = 100 * max(dropFraction / 0.30, 0.6 * leanFraction / 0.25)
+        let rawScore = min(100, max(0, 100 - penalty))
+        let now = metrics.timestamp
+        let alpha: Double
+
+        if let lastScoreUpdateAt {
+            let elapsed = max(0, now.timeIntervalSince(lastScoreUpdateAt))
+            alpha = 1 - exp(-elapsed / 0.4)
+        } else {
+            alpha = 1
+        }
+
+        let current = smoothedScore ?? rawScore
+        let nextScore = current + alpha * (rawScore - current)
+        smoothedScore = nextScore
+        lastScoreUpdateAt = now
+        postureScore = min(100, max(0, Int(nextScore.rounded())))
+    }
+
+    private func recordHistory(metrics: PostureMetrics, status: PostureStatus) {
+        guard metrics.neckDistance.isFinite else { return }
+
+        metricHistory.append(
+            MetricHistorySample(
+                timestamp: metrics.timestamp,
+                neckDistance: metrics.neckDistance,
+                wasSlouching: status == .slouching
+            )
+        )
+
+        let cutoff = metrics.timestamp.addingTimeInterval(-12)
+        metricHistory.removeAll { $0.timestamp < cutoff }
+    }
+
+    private func rememberBodyCalibrationMetric(_ metrics: PostureMetrics) {
+        guard
+            metrics.neckDistance.isFinite,
+            metrics.neckDistance > 0,
+            metrics.shoulderWidth.isFinite,
+            metrics.shoulderWidth >= 0.12,
+            metrics.confidence >= 0.3
+        else {
+            return
+        }
+
+        recentBodyCalibrationMetrics.append(metrics)
+        let cutoff = metrics.timestamp.addingTimeInterval(-4)
+        recentBodyCalibrationMetrics.removeAll { $0.timestamp < cutoff }
+
+        if recentBodyCalibrationMetrics.count > 90 {
+            recentBodyCalibrationMetrics.removeFirst(recentBodyCalibrationMetrics.count - 90)
+        }
+    }
+
+    private static func trackingGuidance(faceDetected: Bool, detail: String?) -> String {
+        let detail = detail ?? ""
+
+        if detail.localizedCaseInsensitiveContains("move back") ||
+            detail.localizedCaseInsensitiveContains("shoulder width") {
+            return "Move back a little so both shoulders fit in the camera view."
+        }
+
+        if detail.localizedCaseInsensitiveContains("left shoulder") {
+            return faceDetected
+                ? "Face is visible. Bring your left shoulder into view."
+                : "Bring your head and left shoulder into view."
+        }
+
+        if detail.localizedCaseInsensitiveContains("right shoulder") {
+            return faceDetected
+                ? "Face is visible. Bring your right shoulder into view."
+                : "Bring your head and right shoulder into view."
+        }
+
+        if detail.localizedCaseInsensitiveContains("confidence") ||
+            detail.localizedCaseInsensitiveContains("unreliable") ||
+            detail.localizedCaseInsensitiveContains("hold still") {
+            return "Hold still for a moment so Sloucher can measure your posture."
+        }
+
+        if faceDetected {
+            return "Face is visible. Bring both shoulders into view so Sloucher can measure posture."
+        }
+
+        return "Move into view with your head and both shoulders visible."
+    }
+
+    private static func calibrationFailureMessage(
+        bodySamples: Int,
+        bodySuccesses: Int,
+        frames: Int,
+        lastIssue: String?
+    ) -> String {
+        let issue = lastIssue.map { " \($0)" } ?? ""
+
+        if bodySuccesses == 0 {
+            return "Couldn't calibrate. Vision did not return a usable upper-body pose in \(frames) frames.\(issue)"
+        }
+
+        return "Couldn't calibrate. Collected \(bodySamples) valid samples from \(bodySuccesses) body frames; need more stable head and shoulder tracking.\(issue)"
+    }
+
+    private func showCalibrationHintIfNeeded() {
+        guard !hasBaseline else { return }
+        guard !runtimeDefaults.bool(forKey: RuntimeKeys.didShowCalibrationHint) else { return }
+        runtimeDefaults.set(true, forKey: RuntimeKeys.didShowCalibrationHint)
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+            guard let self, !self.hasBaseline else { return }
+
+            let alert = NSAlert()
+            alert.alertStyle = .informational
+            alert.messageText = "Calibrate Sloucher once"
+            alert.informativeText = "The camera is on, but posture alerts need a baseline. Sit upright, click the Sloucher menu-bar icon, then choose Calibrate."
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+        }
+    }
+
+    private func publishRuntimeDiagnostics(
+        status: PostureStatus,
+        detail: String?,
+        metrics: PostureMetrics?
+    ) {
+        runtimeDefaults.set(status.rawValue, forKey: RuntimeKeys.status)
+        runtimeDefaults.set(status.displayName, forKey: RuntimeKeys.statusDisplayName)
+        setRuntime(detail, forKey: RuntimeKeys.detail)
+        runtimeDefaults.set(hasBaseline, forKey: RuntimeKeys.hasBaseline)
+        runtimeDefaults.set(Date(), forKey: RuntimeKeys.updatedAt)
+
+        if let baseline = settings.baseline {
+            runtimeDefaults.set(baseline.neckDistance, forKey: RuntimeKeys.baselineNeckDistance)
+            runtimeDefaults.set(baseline.shoulderWidth, forKey: RuntimeKeys.baselineShoulderWidth)
+            setRuntime(baseline.faceCenterY, forKey: RuntimeKeys.baselineFaceCenterY)
+            setRuntime(baseline.faceWidth, forKey: RuntimeKeys.baselineFaceWidth)
+            runtimeDefaults.set(baseline.primarySource.rawValue, forKey: RuntimeKeys.baselinePrimarySource)
+        } else {
+            runtimeDefaults.removeObject(forKey: RuntimeKeys.baselineNeckDistance)
+            runtimeDefaults.removeObject(forKey: RuntimeKeys.baselineShoulderWidth)
+            runtimeDefaults.removeObject(forKey: RuntimeKeys.baselineFaceCenterY)
+            runtimeDefaults.removeObject(forKey: RuntimeKeys.baselineFaceWidth)
+            runtimeDefaults.removeObject(forKey: RuntimeKeys.baselinePrimarySource)
+        }
+
+        if let metrics {
+            runtimeDefaults.set(metrics.source.rawValue, forKey: RuntimeKeys.metricSource)
+            runtimeDefaults.set(metrics.neckDistance, forKey: RuntimeKeys.metricNeckDistance)
+            runtimeDefaults.set(metrics.shoulderWidth, forKey: RuntimeKeys.metricShoulderWidth)
+            runtimeDefaults.set(metrics.closeness, forKey: RuntimeKeys.metricCloseness)
+            setRuntime(metrics.faceCenterY, forKey: RuntimeKeys.metricFaceCenterY)
+            setRuntime(metrics.faceWidth, forKey: RuntimeKeys.metricFaceWidth)
+            runtimeDefaults.set(Double(metrics.confidence), forKey: RuntimeKeys.metricConfidence)
+            runtimeDefaults.set(metrics.timestamp, forKey: RuntimeKeys.metricTimestamp)
+        } else {
+            runtimeDefaults.removeObject(forKey: RuntimeKeys.metricSource)
+            runtimeDefaults.removeObject(forKey: RuntimeKeys.metricNeckDistance)
+            runtimeDefaults.removeObject(forKey: RuntimeKeys.metricShoulderWidth)
+            runtimeDefaults.removeObject(forKey: RuntimeKeys.metricCloseness)
+            runtimeDefaults.removeObject(forKey: RuntimeKeys.metricFaceCenterY)
+            runtimeDefaults.removeObject(forKey: RuntimeKeys.metricFaceWidth)
+            runtimeDefaults.removeObject(forKey: RuntimeKeys.metricConfidence)
+            runtimeDefaults.removeObject(forKey: RuntimeKeys.metricTimestamp)
+        }
+    }
+
+    private func publishCalibrationAttemptSnapshot(
+        prefix: String,
+        status: String,
+        bodySamples: Int,
+        bodySuccesses: Int,
+        frames: Int,
+        rejectedSamples: Int,
+        reason: String?
+    ) {
+        runtimeDefaults.set(status, forKey: "\(prefix).status")
+        runtimeDefaults.set(Date(), forKey: "\(prefix).finishedAt")
+        runtimeDefaults.set(bodySamples, forKey: "\(prefix).bodySamples")
+        runtimeDefaults.set(bodySuccesses, forKey: "\(prefix).bodySuccesses")
+        runtimeDefaults.set(frames, forKey: "\(prefix).frames")
+        runtimeDefaults.set(rejectedSamples, forKey: "\(prefix).rejectedSamples")
+        runtimeDefaults.set(calibrationBodyObservationTotal, forKey: "\(prefix).bodyObservationTotal")
+        runtimeDefaults.set(calibrationValidBodyCandidateTotal, forKey: "\(prefix).validBodyCandidateTotal")
+        runtimeDefaults.set(calibrationFaceDetectedFrames, forKey: "\(prefix).faceDetectedFrames")
+        setRuntime(reason, forKey: "\(prefix).reason")
+    }
+
+    private func publishCalibrationDebugOrientationSweeps() {
+        guard let json = Self.jsonString(calibrationDebugOrientationSweeps) else {
+            runtimeDefaults.removeObject(forKey: RuntimeKeys.calibrationDebugOrientationSweeps)
+            runtimeDefaults.removeObject(forKey: RuntimeKeys.calibrationDebugBestOrientation)
+            return
+        }
+
+        runtimeDefaults.set(json, forKey: RuntimeKeys.calibrationDebugOrientationSweeps)
+        setRuntime(
+            calibrationDebugOrientationSweeps.last?.bestOrientation,
+            forKey: RuntimeKeys.calibrationDebugBestOrientation
+        )
+    }
+
+    private func publishFrameDiagnostics(
+        _ diagnostics: PostureFrameDiagnostics,
+        result: PostureAnalysisResult
+    ) {
+        runtimeDefaults.set(result.acceptedFrame, forKey: RuntimeKeys.frameAccepted)
+        setRuntime(result.reason, forKey: RuntimeKeys.frameReason)
+        runtimeDefaults.set(diagnostics.bodyObservationCount, forKey: RuntimeKeys.frameBodyObservationCount)
+        runtimeDefaults.set(diagnostics.validBodyCandidateCount, forKey: RuntimeKeys.frameValidBodyCandidateCount)
+        runtimeDefaults.set(diagnostics.faceDetected, forKey: RuntimeKeys.frameFaceDetected)
+        setRuntime(diagnostics.bodyFailureReason, forKey: RuntimeKeys.frameBodyFailure)
+        setRuntime(diagnostics.headAnchorSource, forKey: RuntimeKeys.frameHeadAnchorSource)
+        setRuntime(diagnostics.candidateConfidence, forKey: RuntimeKeys.frameCandidateConfidence)
+        setRuntime(diagnostics.candidateShoulderWidth, forKey: RuntimeKeys.frameCandidateShoulderWidth)
+        setRuntime(diagnostics.candidateNeckDistance, forKey: RuntimeKeys.frameCandidateNeckDistance)
+        setRuntime(diagnostics.bestCandidateScore, forKey: RuntimeKeys.frameCandidateScore)
+        setRuntime(diagnostics.rawNoseConfidence, forKey: RuntimeKeys.frameRawNoseConfidence)
+        setRuntime(diagnostics.rawLeftEyeConfidence, forKey: RuntimeKeys.frameRawLeftEyeConfidence)
+        setRuntime(diagnostics.rawRightEyeConfidence, forKey: RuntimeKeys.frameRawRightEyeConfidence)
+        setRuntime(diagnostics.rawLeftShoulderConfidence, forKey: RuntimeKeys.frameRawLeftShoulderConfidence)
+        setRuntime(diagnostics.rawRightShoulderConfidence, forKey: RuntimeKeys.frameRawRightShoulderConfidence)
+        setRuntime(diagnostics.rawShoulderWidth, forKey: RuntimeKeys.frameRawShoulderWidth)
+        setRuntime(diagnostics.rawRejectReason, forKey: RuntimeKeys.frameRawRejectReason)
+    }
+
+    private func setRuntime(_ value: Any?, forKey key: String) {
+        if let value {
+            runtimeDefaults.set(value, forKey: key)
+        } else {
+            runtimeDefaults.removeObject(forKey: key)
+        }
+    }
+
+    private static func jsonString<T: Encodable>(_ value: T) -> String? {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.sortedKeys]
+
+        guard let data = try? encoder.encode(value) else {
+            return nil
+        }
+
+        return String(data: data, encoding: .utf8)
+    }
+
+    private static func bestOrientationName(in results: [PostureOrientationDiagnostics]) -> String? {
+        results.max { first, second in
+            orientationScore(first) < orientationScore(second)
+        }?.orientation
+    }
+
+    private static func orientationScore(_ result: PostureOrientationDiagnostics) -> Double {
+        let confidence = result.candidateConfidence ??
+            result.leftShoulderConfidence ??
+            result.rightShoulderConfidence ??
+            result.noseConfidence ??
+            0
+        let shoulderWidth = result.shoulderWidth ?? 0
+
+        return Double(result.validBodyCandidateCount) * 1000 +
+            Double(result.bodyObservationCount) * 100 +
+            confidence * 10 +
+            shoulderWidth
+    }
+
+    private enum RuntimeKeys {
+        static let didShowCalibrationHint = "runtime.didShowCalibrationHint"
+        static let status = "runtime.status"
+        static let statusDisplayName = "runtime.statusDisplayName"
+        static let detail = "runtime.detail"
+        static let hasBaseline = "runtime.hasBaseline"
+        static let updatedAt = "runtime.updatedAt"
+        static let baselineNeckDistance = "runtime.baseline.neckDistance"
+        static let baselineShoulderWidth = "runtime.baseline.shoulderWidth"
+        static let baselineFaceCenterY = "runtime.baseline.faceCenterY"
+        static let baselineFaceWidth = "runtime.baseline.faceWidth"
+        static let baselinePrimarySource = "runtime.baseline.primarySource"
+        static let metricSource = "runtime.metric.source"
+        static let metricNeckDistance = "runtime.metric.neckDistance"
+        static let metricShoulderWidth = "runtime.metric.shoulderWidth"
+        static let metricCloseness = "runtime.metric.closeness"
+        static let metricFaceCenterY = "runtime.metric.faceCenterY"
+        static let metricFaceWidth = "runtime.metric.faceWidth"
+        static let metricConfidence = "runtime.metric.confidence"
+        static let metricTimestamp = "runtime.metric.timestamp"
+        static let calibrationBodySamples = "runtime.calibration.bodySamples"
+        static let calibrationLastFailure = "runtime.calibration.lastFailure"
+        static let calibrationFrames = "runtime.calibration.frames"
+        static let calibrationBodySuccesses = "runtime.calibration.bodySuccesses"
+        static let calibrationRejectedSamples = "runtime.calibration.rejectedSamples"
+        static let calibrationLastRejectReason = "runtime.calibration.lastRejectReason"
+        static let calibrationBodyObservationCount = "runtime.calibration.bodyObservationCount"
+        static let calibrationValidBodyCandidateCount = "runtime.calibration.validBodyCandidateCount"
+        static let calibrationFaceDetected = "runtime.calibration.faceDetected"
+        static let calibrationLastBodyFailure = "runtime.calibration.lastBodyFailure"
+        static let calibrationLastCandidateConfidence = "runtime.calibration.lastCandidate.confidence"
+        static let calibrationLastCandidateShoulderWidth = "runtime.calibration.lastCandidate.shoulderWidth"
+        static let calibrationLastCandidateNeckDistance = "runtime.calibration.lastCandidate.neckDistance"
+        static let calibrationLastCandidateScore = "runtime.calibration.lastCandidate.score"
+        static let calibrationHeadAnchorSource = "runtime.calibration.headAnchorSource"
+        static let calibrationSeedCandidates = "runtime.calibration.seedCandidates"
+        static let calibrationSeedAccepted = "runtime.calibration.seedAccepted"
+        static let calibrationBodyObservationTotal = "runtime.calibration.bodyObservationTotal"
+        static let calibrationValidBodyCandidateTotal = "runtime.calibration.validBodyCandidateTotal"
+        static let calibrationFaceDetectedFrames = "runtime.calibration.faceDetectedFrames"
+        static let calibrationLastAttemptPrefix = "runtime.calibration.lastAttempt"
+        static let calibrationLastFailedPrefix = "runtime.calibration.lastFailed"
+        static let calibrationLastSucceededPrefix = "runtime.calibration.lastSucceeded"
+        static let calibrationDebugOrientationSweeps = "runtime.calibration.debug.orientationSweeps"
+        static let calibrationDebugBestOrientation = "runtime.calibration.debug.bestOrientation"
+        static let frameAccepted = "runtime.frame.accepted"
+        static let frameReason = "runtime.frame.reason"
+        static let frameBodyObservationCount = "runtime.frame.bodyObservationCount"
+        static let frameValidBodyCandidateCount = "runtime.frame.validBodyCandidateCount"
+        static let frameFaceDetected = "runtime.frame.faceDetected"
+        static let frameBodyFailure = "runtime.frame.bodyFailure"
+        static let frameHeadAnchorSource = "runtime.frame.headAnchorSource"
+        static let frameCandidateConfidence = "runtime.frame.candidate.confidence"
+        static let frameCandidateShoulderWidth = "runtime.frame.candidate.shoulderWidth"
+        static let frameCandidateNeckDistance = "runtime.frame.candidate.neckDistance"
+        static let frameCandidateScore = "runtime.frame.candidate.score"
+        static let frameRawNoseConfidence = "runtime.frame.raw.nose.confidence"
+        static let frameRawLeftEyeConfidence = "runtime.frame.raw.leftEye.confidence"
+        static let frameRawRightEyeConfidence = "runtime.frame.raw.rightEye.confidence"
+        static let frameRawLeftShoulderConfidence = "runtime.frame.raw.leftShoulder.confidence"
+        static let frameRawRightShoulderConfidence = "runtime.frame.raw.rightShoulder.confidence"
+        static let frameRawShoulderWidth = "runtime.frame.raw.shoulderWidth"
+        static let frameRawRejectReason = "runtime.frame.raw.rejectReason"
+    }
+}
