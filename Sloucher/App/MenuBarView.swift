@@ -155,6 +155,9 @@ private struct WebcamPreview: View {
                         .scaledToFill()
                         .frame(width: proxy.size.width, height: proxy.size.height)
                         .clipped()
+                        // Mirror the user-facing preview without changing the
+                        // sample buffer that Vision and forensic capture inspect.
+                        .scaleEffect(x: -1, y: 1)
                 } else {
                     EmptyPreviewMessage()
                 }
@@ -164,6 +167,9 @@ private struct WebcamPreview: View {
                     pose: appState.latestPose,
                     slouching: appState.status == .slouching
                 )
+                // Pose coordinates come from the unmirrored Vision buffer, so mirror
+                // this overlay with the preview to keep debugging marks aligned.
+                .scaleEffect(x: -1, y: 1)
                 BaselineLine(y: appState.baselineHeadY)
                 CornerBrackets(slouching: appState.status == .slouching)
 

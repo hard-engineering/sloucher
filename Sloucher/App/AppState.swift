@@ -3,6 +3,8 @@ import AVFoundation
 import Combine
 import CoreImage
 import Foundation
+import ImageIO
+import UniformTypeIdentifiers
 
 final class AppState: ObservableObject {
     @Published var settings = SettingsStore()
@@ -61,6 +63,26 @@ final class AppState: ObservableObject {
     private var calibrationValidBodyCandidateTotal = 0
     private var calibrationFaceDetectedFrames = 0
     private var calibrationDebugOrientationSweeps: [PostureOrientationSweepDiagnostics] = []
+    private var trackingDebugFrames: [PostureTrackingFrameDiagnostics] = []
+    private var trackingDebugFrameNumber = 0
+    private var trackingDebugOrientationSweeps: [PostureOrientationSweepDiagnostics] = []
+    private var lastValidForensicFrame: ForensicFrameSnapshot?
+    private var pendingForensicCollapse: ForensicFrameSnapshot?
+    private var nextForensicCaptureAllowedAt = Date.distantPast
+
+    private struct RawPlaneDump {
+        let name: String
+        let data: Data
+    }
+
+    private struct ForensicFrameSnapshot {
+        let trackingFrame: PostureTrackingFrameDiagnostics
+        let pixelBuffer: PosturePixelBufferDiagnostics
+        let image: CGImage?
+        let rawPlanes: [RawPlaneDump]
+        let bodyObservations: [PostureBodyObservationDiagnostics]
+        let orientationSweepResults: [PostureOrientationDiagnostics]
+    }
 
     var hasBaseline: Bool {
         settings.baseline?.hasBodyBaseline == true
@@ -189,6 +211,7 @@ final class AppState: ObservableObject {
         // so diagnostics do not imply a stale shortcut path is active.
         runtimeDefaults.set(0, forKey: RuntimeKeys.calibrationSeedCandidates)
         runtimeDefaults.set(0, forKey: RuntimeKeys.calibrationSeedAccepted)
+        resetTrackingDebugDiagnostics()
         configureServices()
         configureSettingsObservation()
         requestPermissionsAndStart()
@@ -230,6 +253,7 @@ final class AppState: ObservableObject {
             calibrationFaceDetectedFrames = 0
             calibrationDebugOrientationSweeps = []
             postureAnalyzer.resetCalibrationDebugDiagnostics()
+            resetTrackingDebugDiagnostics()
             runtimeDefaults.set(0, forKey: RuntimeKeys.calibrationSeedCandidates)
             runtimeDefaults.set(0, forKey: RuntimeKeys.calibrationSeedAccepted)
             runtimeDefaults.set(0, forKey: RuntimeKeys.calibrationRejectedSamples)
@@ -398,16 +422,32 @@ final class AppState: ObservableObject {
     private func processFrame(_ sampleBuffer: CMSampleBuffer) {
         analysisQueue.async { [weak self] in
             guard let self else { return }
-            let forceInference = self.calibrator.isCollecting || self.inspectorVisible
+            let isCalibrating = self.calibrator.isCollecting
+            let collectTrackingDiagnostics = !isCalibrating && self.hasBaseline
+            let forceInference = isCalibrating || self.inspectorVisible
             let frameImage = self.makeFrameImage(from: sampleBuffer)
+            let pixelBufferDiagnostics = Self.pixelBufferDiagnostics(from: sampleBuffer)
             let result = self.postureAnalyzer.analyze(
                 sampleBuffer: sampleBuffer,
                 config: self.settings.decisionConfig,
                 forceInference: forceInference,
-                collectCalibrationDiagnostics: self.calibrator.isCollecting
+                collectCalibrationDiagnostics: isCalibrating,
+                collectTrackingDiagnostics: collectTrackingDiagnostics
             )
             let frameDiagnostics = self.postureAnalyzer.lastFrameDiagnostics
             self.publishFrameDiagnostics(frameDiagnostics, result: result)
+            self.publishPixelBufferDiagnostics(pixelBufferDiagnostics)
+            if collectTrackingDiagnostics, let pixelBufferDiagnostics {
+                let trackingFrame = self.recordTrackingDiagnostics(frameDiagnostics, result: result)
+                self.updateForensicCapture(
+                    trackingFrame: trackingFrame,
+                    pixelBufferDiagnostics: pixelBufferDiagnostics,
+                    frameDiagnostics: frameDiagnostics,
+                    result: result,
+                    sampleBuffer: sampleBuffer,
+                    frameImage: frameImage
+                )
+            }
 
             if let metrics = result.metrics, metrics.source == .body {
                 self.rememberBodyCalibrationMetric(metrics)
@@ -947,6 +987,293 @@ final class AppState: ObservableObject {
         )
     }
 
+    private func recordTrackingDiagnostics(
+        _ diagnostics: PostureFrameDiagnostics,
+        result: PostureAnalysisResult
+    ) -> PostureTrackingFrameDiagnostics {
+        trackingDebugFrameNumber += 1
+
+        // Keep successful and failed live frames in the same window because the
+        // bug is the transition from a valid calibration to unusable tracking.
+        let frame = PostureTrackingFrameDiagnostics(
+            frame: trackingDebugFrameNumber,
+            timestamp: Date(),
+            status: result.status.rawValue,
+            acceptedFrame: result.acceptedFrame,
+            reason: result.reason,
+            bodyObservationCount: diagnostics.bodyObservationCount,
+            validBodyCandidateCount: diagnostics.validBodyCandidateCount,
+            faceDetected: diagnostics.faceDetected,
+            candidateConfidence: diagnostics.candidateConfidence,
+            candidateShoulderWidth: diagnostics.candidateShoulderWidth,
+            candidateNeckDistance: diagnostics.candidateNeckDistance,
+            rawNoseConfidence: diagnostics.rawNoseConfidence,
+            rawLeftShoulderConfidence: diagnostics.rawLeftShoulderConfidence,
+            rawRightShoulderConfidence: diagnostics.rawRightShoulderConfidence,
+            rawShoulderWidth: diagnostics.rawShoulderWidth,
+            rawRejectReason: diagnostics.rawRejectReason,
+            metricShoulderWidth: result.metrics?.shoulderWidth,
+            metricNeckDistance: result.metrics?.neckDistance,
+            metricCloseness: result.metrics?.closeness
+        )
+
+        trackingDebugFrames.append(frame)
+        trackingDebugFrames = Array(trackingDebugFrames.suffix(60))
+
+        if !diagnostics.orientationSweepResults.isEmpty {
+            let sweep = PostureOrientationSweepDiagnostics(
+                frame: trackingDebugFrameNumber,
+                timestamp: Date(),
+                results: diagnostics.orientationSweepResults,
+                bestOrientation: Self.bestOrientationName(in: diagnostics.orientationSweepResults)
+            )
+            trackingDebugOrientationSweeps.append(sweep)
+            trackingDebugOrientationSweeps = Array(trackingDebugOrientationSweeps.suffix(5))
+            publishTrackingDebugOrientationSweeps()
+        }
+
+        publishTrackingDebugFrames()
+        return frame
+    }
+
+    private func publishTrackingDebugFrames() {
+        guard !trackingDebugFrames.isEmpty else {
+            runtimeDefaults.removeObject(forKey: RuntimeKeys.trackingDebugFrames)
+            runtimeDefaults.removeObject(forKey: RuntimeKeys.trackingDebugSummary)
+            return
+        }
+
+        let summary = Self.trackingSummary(from: trackingDebugFrames)
+        setRuntime(Self.jsonString(trackingDebugFrames), forKey: RuntimeKeys.trackingDebugFrames)
+        setRuntime(Self.jsonString(summary), forKey: RuntimeKeys.trackingDebugSummary)
+        runtimeDefaults.set(summary.frameCount, forKey: RuntimeKeys.trackingDebugWindowFrames)
+        runtimeDefaults.set(summary.acceptedFrameCount, forKey: RuntimeKeys.trackingDebugAcceptedFrames)
+        runtimeDefaults.set(summary.faceDetectedFrameCount, forKey: RuntimeKeys.trackingDebugFaceDetectedFrames)
+        runtimeDefaults.set(summary.bodyObservationFrameCount, forKey: RuntimeKeys.trackingDebugBodyObservationFrames)
+        runtimeDefaults.set(summary.validCandidateFrameCount, forKey: RuntimeKeys.trackingDebugValidCandidateFrames)
+        runtimeDefaults.set(summary.noBodyObservationFrameCount, forKey: RuntimeKeys.trackingDebugNoBodyObservationFrames)
+        runtimeDefaults.set(summary.invalidBodyCandidateFrameCount, forKey: RuntimeKeys.trackingDebugInvalidCandidateFrames)
+        setRuntime(summary.latestStatus, forKey: RuntimeKeys.trackingDebugLatestStatus)
+        setRuntime(summary.latestRejectReason, forKey: RuntimeKeys.trackingDebugLatestRejectReason)
+        setRuntime(summary.rawShoulderWidthMin, forKey: RuntimeKeys.trackingDebugRawShoulderWidthMin)
+        setRuntime(summary.rawShoulderWidthMedian, forKey: RuntimeKeys.trackingDebugRawShoulderWidthMedian)
+        setRuntime(summary.rawShoulderWidthMax, forKey: RuntimeKeys.trackingDebugRawShoulderWidthMax)
+        setRuntime(summary.metricShoulderWidthMin, forKey: RuntimeKeys.trackingDebugMetricShoulderWidthMin)
+        setRuntime(summary.metricShoulderWidthMedian, forKey: RuntimeKeys.trackingDebugMetricShoulderWidthMedian)
+        setRuntime(summary.metricShoulderWidthMax, forKey: RuntimeKeys.trackingDebugMetricShoulderWidthMax)
+    }
+
+    private func publishTrackingDebugOrientationSweeps() {
+        guard let json = Self.jsonString(trackingDebugOrientationSweeps) else {
+            runtimeDefaults.removeObject(forKey: RuntimeKeys.trackingDebugOrientationSweeps)
+            runtimeDefaults.removeObject(forKey: RuntimeKeys.trackingDebugBestOrientation)
+            return
+        }
+
+        runtimeDefaults.set(json, forKey: RuntimeKeys.trackingDebugOrientationSweeps)
+        setRuntime(
+            trackingDebugOrientationSweeps.last?.bestOrientation,
+            forKey: RuntimeKeys.trackingDebugBestOrientation
+        )
+    }
+
+    private func resetTrackingDebugDiagnostics() {
+        trackingDebugFrames = []
+        trackingDebugFrameNumber = 0
+        trackingDebugOrientationSweeps = []
+        lastValidForensicFrame = nil
+        pendingForensicCollapse = nil
+        nextForensicCaptureAllowedAt = .distantPast
+        postureAnalyzer.resetTrackingDebugDiagnostics()
+        runtimeDefaults.removeObject(forKey: RuntimeKeys.trackingDebugFrames)
+        runtimeDefaults.removeObject(forKey: RuntimeKeys.trackingDebugSummary)
+        runtimeDefaults.removeObject(forKey: RuntimeKeys.trackingDebugOrientationSweeps)
+        runtimeDefaults.removeObject(forKey: RuntimeKeys.trackingDebugBestOrientation)
+        runtimeDefaults.removeObject(forKey: RuntimeKeys.trackingDebugWindowFrames)
+        runtimeDefaults.removeObject(forKey: RuntimeKeys.trackingDebugAcceptedFrames)
+        runtimeDefaults.removeObject(forKey: RuntimeKeys.trackingDebugFaceDetectedFrames)
+        runtimeDefaults.removeObject(forKey: RuntimeKeys.trackingDebugBodyObservationFrames)
+        runtimeDefaults.removeObject(forKey: RuntimeKeys.trackingDebugValidCandidateFrames)
+        runtimeDefaults.removeObject(forKey: RuntimeKeys.trackingDebugNoBodyObservationFrames)
+        runtimeDefaults.removeObject(forKey: RuntimeKeys.trackingDebugInvalidCandidateFrames)
+        runtimeDefaults.removeObject(forKey: RuntimeKeys.trackingDebugLatestStatus)
+        runtimeDefaults.removeObject(forKey: RuntimeKeys.trackingDebugLatestRejectReason)
+        runtimeDefaults.removeObject(forKey: RuntimeKeys.trackingDebugRawShoulderWidthMin)
+        runtimeDefaults.removeObject(forKey: RuntimeKeys.trackingDebugRawShoulderWidthMedian)
+        runtimeDefaults.removeObject(forKey: RuntimeKeys.trackingDebugRawShoulderWidthMax)
+        runtimeDefaults.removeObject(forKey: RuntimeKeys.trackingDebugMetricShoulderWidthMin)
+        runtimeDefaults.removeObject(forKey: RuntimeKeys.trackingDebugMetricShoulderWidthMedian)
+        runtimeDefaults.removeObject(forKey: RuntimeKeys.trackingDebugMetricShoulderWidthMax)
+    }
+
+    private func updateForensicCapture(
+        trackingFrame: PostureTrackingFrameDiagnostics,
+        pixelBufferDiagnostics: PosturePixelBufferDiagnostics,
+        frameDiagnostics: PostureFrameDiagnostics,
+        result: PostureAnalysisResult,
+        sampleBuffer: CMSampleBuffer,
+        frameImage: CGImage?
+    ) {
+        guard Date() >= nextForensicCaptureAllowedAt else { return }
+
+        let collapsed = isCollapsedShoulderFrame(trackingFrame, diagnostics: frameDiagnostics)
+        let recovered = result.acceptedFrame && pendingForensicCollapse != nil
+
+        if result.acceptedFrame {
+            let snapshot = makeForensicSnapshot(
+                trackingFrame: trackingFrame,
+                pixelBufferDiagnostics: pixelBufferDiagnostics,
+                frameDiagnostics: frameDiagnostics,
+                sampleBuffer: sampleBuffer,
+                frameImage: frameImage
+            )
+
+            if recovered {
+                saveForensicSequence(recoveryFrame: snapshot)
+                pendingForensicCollapse = nil
+                nextForensicCaptureAllowedAt = Date().addingTimeInterval(20)
+            }
+
+            lastValidForensicFrame = snapshot
+            return
+        }
+
+        guard collapsed, pendingForensicCollapse == nil else { return }
+
+        // Capture the first collapsed-shoulder frame. The paired recovery frame
+        // proves what changed in the input when a tiny movement reacquires pose.
+        pendingForensicCollapse = makeForensicSnapshot(
+            trackingFrame: trackingFrame,
+            pixelBufferDiagnostics: pixelBufferDiagnostics,
+            frameDiagnostics: frameDiagnostics,
+            sampleBuffer: sampleBuffer,
+            frameImage: frameImage
+        )
+    }
+
+    private func isCollapsedShoulderFrame(
+        _ frame: PostureTrackingFrameDiagnostics,
+        diagnostics: PostureFrameDiagnostics
+    ) -> Bool {
+        guard
+            frame.faceDetected,
+            !frame.acceptedFrame,
+            frame.bodyObservationCount > 0,
+            frame.validBodyCandidateCount == 0,
+            let rawShoulderWidth = frame.rawShoulderWidth,
+            let baselineShoulderWidth = settings.baseline?.shoulderWidth,
+            baselineShoulderWidth.isFinite,
+            baselineShoulderWidth > 0
+        else {
+            return false
+        }
+
+        let leftConfidence = frame.rawLeftShoulderConfidence ?? 0
+        let rightConfidence = frame.rawRightShoulderConfidence ?? 0
+        let collapsedRelativeToBaseline = rawShoulderWidth < baselineShoulderWidth * 0.45
+
+        return collapsedRelativeToBaseline &&
+            rawShoulderWidth < 0.12 &&
+            max(leftConfidence, rightConfidence) >= 0.5 &&
+            diagnostics.bodyFailureReason?.localizedCaseInsensitiveContains("move back") == true
+    }
+
+    private func makeForensicSnapshot(
+        trackingFrame: PostureTrackingFrameDiagnostics,
+        pixelBufferDiagnostics: PosturePixelBufferDiagnostics,
+        frameDiagnostics: PostureFrameDiagnostics,
+        sampleBuffer: CMSampleBuffer,
+        frameImage: CGImage?
+    ) -> ForensicFrameSnapshot {
+        ForensicFrameSnapshot(
+            trackingFrame: trackingFrame,
+            pixelBuffer: pixelBufferDiagnostics,
+            image: frameImage,
+            rawPlanes: Self.rawPlaneDumps(from: sampleBuffer),
+            bodyObservations: frameDiagnostics.bodyObservations,
+            orientationSweepResults: frameDiagnostics.orientationSweepResults
+        )
+    }
+
+    private func saveForensicSequence(recoveryFrame: ForensicFrameSnapshot) {
+        let capturedAt = Date()
+        let directory = forensicDirectory(capturedAt: capturedAt)
+
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            var reports: [PostureForensicFrameReport] = []
+
+            if let lastValidForensicFrame {
+                reports.append(try saveForensicFrame(lastValidForensicFrame, role: "last-valid", directory: directory))
+            }
+
+            if let pendingForensicCollapse {
+                reports.append(try saveForensicFrame(pendingForensicCollapse, role: "collapsed", directory: directory))
+            }
+
+            reports.append(try saveForensicFrame(recoveryFrame, role: "recovered", directory: directory))
+
+            let report = PostureForensicSequenceReport(
+                capturedAt: capturedAt,
+                trigger: "face-visible-collapsed-shoulders-then-recovered",
+                directory: directory.path,
+                baselineShoulderWidth: settings.baseline?.shoulderWidth,
+                baselineNeckDistance: settings.baseline?.neckDistance,
+                frames: reports
+            )
+            let reportURL = directory.appendingPathComponent("sequence.json")
+            try Self.writeJSON(report, to: reportURL)
+            runtimeDefaults.set(directory.path, forKey: RuntimeKeys.forensicLatestDirectory)
+            runtimeDefaults.set(reportURL.path, forKey: RuntimeKeys.forensicLatestReport)
+            runtimeDefaults.set(capturedAt, forKey: RuntimeKeys.forensicLatestCapturedAt)
+        } catch {
+            runtimeDefaults.set(error.localizedDescription, forKey: RuntimeKeys.forensicLastError)
+        }
+    }
+
+    private func saveForensicFrame(
+        _ snapshot: ForensicFrameSnapshot,
+        role: String,
+        directory: URL
+    ) throws -> PostureForensicFrameReport {
+        var imageFile: String?
+        if let image = snapshot.image {
+            let filename = "\(role).png"
+            try Self.writePNG(image, to: directory.appendingPathComponent(filename))
+            imageFile = filename
+        }
+
+        var rawFiles: [String] = []
+        for plane in snapshot.rawPlanes {
+            let filename = "\(role)-\(plane.name).raw"
+            try plane.data.write(to: directory.appendingPathComponent(filename), options: .atomic)
+            rawFiles.append(filename)
+        }
+
+        return PostureForensicFrameReport(
+            role: role,
+            trackingFrame: snapshot.trackingFrame,
+            pixelBuffer: snapshot.pixelBuffer,
+            bodyObservations: snapshot.bodyObservations,
+            orientationSweepResults: snapshot.orientationSweepResults,
+            imageFile: imageFile,
+            rawFiles: rawFiles
+        )
+    }
+
+    private func forensicDirectory(capturedAt: Date) -> URL {
+        let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
+            .first ?? URL(fileURLWithPath: NSTemporaryDirectory())
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let name = formatter.string(from: capturedAt)
+            .replacingOccurrences(of: ":", with: "-")
+        return root
+            .appendingPathComponent("Sloucher", isDirectory: true)
+            .appendingPathComponent("Forensics", isDirectory: true)
+            .appendingPathComponent(name, isDirectory: true)
+    }
+
     private func publishFrameDiagnostics(
         _ diagnostics: PostureFrameDiagnostics,
         result: PostureAnalysisResult
@@ -971,6 +1298,25 @@ final class AppState: ObservableObject {
         setRuntime(diagnostics.rawRejectReason, forKey: RuntimeKeys.frameRawRejectReason)
     }
 
+    private func publishPixelBufferDiagnostics(_ diagnostics: PosturePixelBufferDiagnostics?) {
+        guard let diagnostics else {
+            runtimeDefaults.removeObject(forKey: RuntimeKeys.framePixelFormat)
+            runtimeDefaults.removeObject(forKey: RuntimeKeys.framePixelFormatCode)
+            runtimeDefaults.removeObject(forKey: RuntimeKeys.framePixelWidth)
+            runtimeDefaults.removeObject(forKey: RuntimeKeys.framePixelHeight)
+            runtimeDefaults.removeObject(forKey: RuntimeKeys.framePixelIsPlanar)
+            runtimeDefaults.removeObject(forKey: RuntimeKeys.framePixelPlaneCount)
+            return
+        }
+
+        runtimeDefaults.set(diagnostics.pixelFormat, forKey: RuntimeKeys.framePixelFormat)
+        runtimeDefaults.set(Int(diagnostics.pixelFormatCode), forKey: RuntimeKeys.framePixelFormatCode)
+        runtimeDefaults.set(diagnostics.width, forKey: RuntimeKeys.framePixelWidth)
+        runtimeDefaults.set(diagnostics.height, forKey: RuntimeKeys.framePixelHeight)
+        runtimeDefaults.set(diagnostics.isPlanar, forKey: RuntimeKeys.framePixelIsPlanar)
+        runtimeDefaults.set(diagnostics.planeCount, forKey: RuntimeKeys.framePixelPlaneCount)
+    }
+
     private func setRuntime(_ value: Any?, forKey key: String) {
         if let value {
             runtimeDefaults.set(value, forKey: key)
@@ -989,6 +1335,176 @@ final class AppState: ObservableObject {
         }
 
         return String(data: data, encoding: .utf8)
+    }
+
+    private static func writeJSON<T: Encodable>(_ value: T, to url: URL) throws {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(value)
+        try data.write(to: url, options: .atomic)
+    }
+
+    private static func writePNG(_ image: CGImage, to url: URL) throws {
+        guard
+            let destination = CGImageDestinationCreateWithURL(
+                url as CFURL,
+                UTType.png.identifier as CFString,
+                1,
+                nil
+            )
+        else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+
+        CGImageDestinationAddImage(destination, image, nil)
+        guard CGImageDestinationFinalize(destination) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+    }
+
+    private static func pixelBufferDiagnostics(from sampleBuffer: CMSampleBuffer) -> PosturePixelBufferDiagnostics? {
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return nil }
+
+        let format = CVPixelBufferGetPixelFormatType(pixelBuffer)
+        let planeCount = CVPixelBufferGetPlaneCount(pixelBuffer)
+        let isPlanar = planeCount > 0
+        let presentationTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+
+        if isPlanar {
+            let planes = 0..<planeCount
+            return PosturePixelBufferDiagnostics(
+                width: CVPixelBufferGetWidth(pixelBuffer),
+                height: CVPixelBufferGetHeight(pixelBuffer),
+                pixelFormat: fourCC(format),
+                pixelFormatCode: format,
+                isPlanar: true,
+                planeCount: planeCount,
+                bytesPerRow: planes.map { CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, $0) },
+                planeWidths: planes.map { CVPixelBufferGetWidthOfPlane(pixelBuffer, $0) },
+                planeHeights: planes.map { CVPixelBufferGetHeightOfPlane(pixelBuffer, $0) },
+                presentationTimeSeconds: presentationTime.isValid ? presentationTime.seconds : nil
+            )
+        }
+
+        return PosturePixelBufferDiagnostics(
+            width: CVPixelBufferGetWidth(pixelBuffer),
+            height: CVPixelBufferGetHeight(pixelBuffer),
+            pixelFormat: fourCC(format),
+            pixelFormatCode: format,
+            isPlanar: false,
+            planeCount: 0,
+            bytesPerRow: [CVPixelBufferGetBytesPerRow(pixelBuffer)],
+            planeWidths: [CVPixelBufferGetWidth(pixelBuffer)],
+            planeHeights: [CVPixelBufferGetHeight(pixelBuffer)],
+            presentationTimeSeconds: presentationTime.isValid ? presentationTime.seconds : nil
+        )
+    }
+
+    private static func rawPlaneDumps(from sampleBuffer: CMSampleBuffer) -> [RawPlaneDump] {
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return [] }
+
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+
+        let planeCount = CVPixelBufferGetPlaneCount(pixelBuffer)
+        if planeCount > 0 {
+            return (0..<planeCount).compactMap { plane in
+                guard let baseAddress = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, plane) else {
+                    return nil
+                }
+
+                let byteCount = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, plane) *
+                    CVPixelBufferGetHeightOfPlane(pixelBuffer, plane)
+                return RawPlaneDump(
+                    name: "plane\(plane)",
+                    data: Data(bytes: baseAddress, count: byteCount)
+                )
+            }
+        }
+
+        guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else { return [] }
+        let byteCount = CVPixelBufferGetBytesPerRow(pixelBuffer) * CVPixelBufferGetHeight(pixelBuffer)
+        return [
+            RawPlaneDump(
+                name: "packed",
+                data: Data(bytes: baseAddress, count: byteCount)
+            )
+        ]
+    }
+
+    private static func fourCC(_ value: OSType) -> String {
+        let bytes: [UInt8] = [
+            UInt8((value >> 24) & 0xff),
+            UInt8((value >> 16) & 0xff),
+            UInt8((value >> 8) & 0xff),
+            UInt8(value & 0xff)
+        ]
+
+        let scalars = bytes.map { byte -> UnicodeScalar in
+            if byte >= 32 && byte <= 126 {
+                return UnicodeScalar(byte)
+            }
+            return "."
+        }
+
+        return String(String.UnicodeScalarView(scalars))
+    }
+
+    private static func trackingSummary(
+        from frames: [PostureTrackingFrameDiagnostics]
+    ) -> PostureTrackingSummaryDiagnostics {
+        let shoulderWidths = frames
+            .compactMap(\.rawShoulderWidth)
+            .filter(\.isFinite)
+            .sorted()
+        let metricShoulderWidths = frames
+            .compactMap(\.metricShoulderWidth)
+            .filter(\.isFinite)
+            .sorted()
+        let rejectReasons = frames
+            .filter { !$0.acceptedFrame }
+            .compactMap { $0.rawRejectReason ?? $0.reason }
+        let rejectReasonCounts = Dictionary(grouping: rejectReasons, by: { $0 })
+            .mapValues(\.count)
+
+        return PostureTrackingSummaryDiagnostics(
+            frameCount: frames.count,
+            acceptedFrameCount: frames.filter(\.acceptedFrame).count,
+            faceDetectedFrameCount: frames.filter(\.faceDetected).count,
+            bodyObservationFrameCount: frames.filter { $0.bodyObservationCount > 0 }.count,
+            validCandidateFrameCount: frames.filter { $0.validBodyCandidateCount > 0 }.count,
+            noBodyObservationFrameCount: frames.filter {
+                !$0.acceptedFrame && $0.bodyObservationCount == 0
+            }.count,
+            invalidBodyCandidateFrameCount: frames.filter {
+                !$0.acceptedFrame &&
+                    $0.bodyObservationCount > 0 &&
+                    $0.validBodyCandidateCount == 0
+            }.count,
+            latestStatus: frames.last?.status,
+            latestRejectReason: frames.last.flatMap {
+                $0.acceptedFrame ? nil : ($0.rawRejectReason ?? $0.reason)
+            },
+            rawShoulderWidthMin: shoulderWidths.first,
+            rawShoulderWidthMedian: median(shoulderWidths),
+            rawShoulderWidthMax: shoulderWidths.last,
+            metricShoulderWidthMin: metricShoulderWidths.first,
+            metricShoulderWidthMedian: median(metricShoulderWidths),
+            metricShoulderWidthMax: metricShoulderWidths.last,
+            rejectReasonCounts: rejectReasonCounts
+        )
+    }
+
+    private static func median(_ values: [Double]) -> Double? {
+        guard !values.isEmpty else { return nil }
+
+        let midpoint = values.count / 2
+        if values.count.isMultiple(of: 2) {
+            return (values[midpoint - 1] + values[midpoint]) / 2
+        }
+
+        return values[midpoint]
     }
 
     private static func bestOrientationName(in results: [PostureOrientationDiagnostics]) -> String? {
@@ -1074,5 +1590,34 @@ final class AppState: ObservableObject {
         static let frameRawRightShoulderConfidence = "runtime.frame.raw.rightShoulder.confidence"
         static let frameRawShoulderWidth = "runtime.frame.raw.shoulderWidth"
         static let frameRawRejectReason = "runtime.frame.raw.rejectReason"
+        static let framePixelFormat = "runtime.frame.pixel.format"
+        static let framePixelFormatCode = "runtime.frame.pixel.formatCode"
+        static let framePixelWidth = "runtime.frame.pixel.width"
+        static let framePixelHeight = "runtime.frame.pixel.height"
+        static let framePixelIsPlanar = "runtime.frame.pixel.isPlanar"
+        static let framePixelPlaneCount = "runtime.frame.pixel.planeCount"
+        static let trackingDebugFrames = "runtime.tracking.debug.frames"
+        static let trackingDebugSummary = "runtime.tracking.debug.summary"
+        static let trackingDebugOrientationSweeps = "runtime.tracking.debug.orientationSweeps"
+        static let trackingDebugBestOrientation = "runtime.tracking.debug.bestOrientation"
+        static let trackingDebugWindowFrames = "runtime.tracking.debug.window.frames"
+        static let trackingDebugAcceptedFrames = "runtime.tracking.debug.window.acceptedFrames"
+        static let trackingDebugFaceDetectedFrames = "runtime.tracking.debug.window.faceDetectedFrames"
+        static let trackingDebugBodyObservationFrames = "runtime.tracking.debug.window.bodyObservationFrames"
+        static let trackingDebugValidCandidateFrames = "runtime.tracking.debug.window.validCandidateFrames"
+        static let trackingDebugNoBodyObservationFrames = "runtime.tracking.debug.window.noBodyObservationFrames"
+        static let trackingDebugInvalidCandidateFrames = "runtime.tracking.debug.window.invalidCandidateFrames"
+        static let trackingDebugLatestStatus = "runtime.tracking.debug.latestStatus"
+        static let trackingDebugLatestRejectReason = "runtime.tracking.debug.latestRejectReason"
+        static let trackingDebugRawShoulderWidthMin = "runtime.tracking.debug.rawShoulderWidth.min"
+        static let trackingDebugRawShoulderWidthMedian = "runtime.tracking.debug.rawShoulderWidth.median"
+        static let trackingDebugRawShoulderWidthMax = "runtime.tracking.debug.rawShoulderWidth.max"
+        static let trackingDebugMetricShoulderWidthMin = "runtime.tracking.debug.metricShoulderWidth.min"
+        static let trackingDebugMetricShoulderWidthMedian = "runtime.tracking.debug.metricShoulderWidth.median"
+        static let trackingDebugMetricShoulderWidthMax = "runtime.tracking.debug.metricShoulderWidth.max"
+        static let forensicLatestDirectory = "runtime.forensics.latestDirectory"
+        static let forensicLatestReport = "runtime.forensics.latestReport"
+        static let forensicLatestCapturedAt = "runtime.forensics.latestCapturedAt"
+        static let forensicLastError = "runtime.forensics.lastError"
     }
 }

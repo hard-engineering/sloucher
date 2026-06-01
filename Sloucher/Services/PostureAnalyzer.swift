@@ -14,6 +14,7 @@ final class PostureAnalyzer {
     private let motionGate = FrameMotionGate()
     private let minimumJointConfidence: VNConfidence = 0.22
     private let calibrationOrientationSweepLimit = 3
+    private let trackingOrientationSweepLimit = 5
 
     private var currentStatus: PostureStatus = .good
     private var slouchCandidateSince: Date?
@@ -22,6 +23,12 @@ final class PostureAnalyzer {
     private var lastReliableMetrics: PostureMetrics?
     private var lastReliablePose: PoseFrame?
     private var calibrationOrientationSweepCount = 0
+    private var trackingOrientationSweepCount = 0
+
+    private enum OrientationSweepMode {
+        case calibration
+        case tracking
+    }
 
     private enum MetricExtractionResult {
         case success(PostureMetrics, PoseFrame?)
@@ -74,7 +81,8 @@ final class PostureAnalyzer {
         sampleBuffer: CMSampleBuffer,
         config: PostureDecisionConfig,
         forceInference: Bool = false,
-        collectCalibrationDiagnostics: Bool = false
+        collectCalibrationDiagnostics: Bool = false,
+        collectTrackingDiagnostics: Bool = false
     ) -> PostureAnalysisResult {
         let now = Date()
         lastFrameDiagnostics = .empty
@@ -88,7 +96,8 @@ final class PostureAnalyzer {
         switch extractMetrics(
             from: sampleBuffer,
             now: now,
-            collectCalibrationDiagnostics: collectCalibrationDiagnostics
+            collectCalibrationDiagnostics: collectCalibrationDiagnostics,
+            collectTrackingDiagnostics: collectTrackingDiagnostics
         ) {
         case .success(let metrics, let pose):
             unreliableSince = nil
@@ -113,14 +122,21 @@ final class PostureAnalyzer {
         calibrationOrientationSweepCount = 0
     }
 
+    func resetTrackingDebugDiagnostics() {
+        trackingOrientationSweepCount = 0
+    }
+
     private func extractMetrics(
         from sampleBuffer: CMSampleBuffer,
         now: Date,
-        collectCalibrationDiagnostics: Bool
+        collectCalibrationDiagnostics: Bool,
+        collectTrackingDiagnostics: Bool
     ) -> MetricExtractionResult {
         let bodyRequest = VNDetectHumanBodyPoseRequest()
         let faceRequest = VNDetectFaceRectanglesRequest()
         let faceLandmarksRequest = VNDetectFaceLandmarksRequest()
+        // The capture output is intentionally unmirrored; preview mirroring is UI-only.
+        // Passing .up keeps Vision's coordinates tied to the native camera buffer.
         let handler = VNImageRequestHandler(cmSampleBuffer: sampleBuffer, orientation: .up, options: [:])
 
         do {
@@ -141,7 +157,9 @@ final class PostureAnalyzer {
             return .success(metrics, pose)
         case .failure(let bodyReason, _):
             if collectCalibrationDiagnostics, faceSignal != nil {
-                collectOrientationSweepIfNeeded(from: sampleBuffer)
+                collectOrientationSweepIfNeeded(from: sampleBuffer, mode: .calibration)
+            } else if collectTrackingDiagnostics, faceSignal != nil {
+                collectOrientationSweepIfNeeded(from: sampleBuffer, mode: .tracking)
             }
 
             return .failure(bodyReason, facePose)
@@ -170,6 +188,9 @@ final class PostureAnalyzer {
                 switch makeBodyCandidate(from: points, faceSignal: faceSignal, now: now) {
                 case .success(let metrics, let pose):
                     recordRawBodyProbe(rawBodyProbe(from: points, rejectReason: nil))
+                    lastFrameDiagnostics.bodyObservations.append(
+                        bodyObservationDiagnostics(from: points, validCandidate: true, rejectReason: nil)
+                    )
                     let pose = pose ?? makePosePlaceholder(metrics: metrics, now: now)
                     candidates.append(
                         BodyCandidate(
@@ -181,9 +202,22 @@ final class PostureAnalyzer {
                     )
                 case .failure(let reason, _):
                     recordRawBodyProbe(rawBodyProbe(from: points, rejectReason: reason))
+                    lastFrameDiagnostics.bodyObservations.append(
+                        bodyObservationDiagnostics(from: points, validCandidate: false, rejectReason: reason)
+                    )
                     lastFailureReason = reason
                 }
             } catch {
+                lastFrameDiagnostics.bodyObservations.append(
+                    PostureBodyObservationDiagnostics(
+                        validCandidate: false,
+                        rejectReason: "Vision joints unavailable.",
+                        shoulderWidth: nil,
+                        neckDistance: nil,
+                        candidateConfidence: nil,
+                        joints: [:]
+                    )
+                )
                 lastFailureReason = "Vision joints unavailable."
             }
         }
@@ -315,6 +349,33 @@ final class PostureAnalyzer {
             neckDistance: neckDistance,
             candidateConfidence: candidateConfidence,
             rejectReason: rejectReason
+        )
+    }
+
+    private func bodyObservationDiagnostics(
+        from points: [VNHumanBodyPoseObservation.JointName: VNRecognizedPoint],
+        validCandidate: Bool,
+        rejectReason: String?
+    ) -> PostureBodyObservationDiagnostics {
+        let probe = rawBodyProbe(from: points, rejectReason: rejectReason)
+        var joints: [String: PostureJointDiagnostics] = [:]
+
+        for (joint, point) in points {
+            guard point.location.x.isFinite, point.location.y.isFinite else { continue }
+            joints[String(describing: joint)] = PostureJointDiagnostics(
+                x: Double(point.location.x),
+                y: Double(point.location.y),
+                confidence: Double(point.confidence)
+            )
+        }
+
+        return PostureBodyObservationDiagnostics(
+            validCandidate: validCandidate,
+            rejectReason: rejectReason,
+            shoulderWidth: probe.shoulderWidth,
+            neckDistance: probe.neckDistance,
+            candidateConfidence: probe.candidateConfidence,
+            joints: joints
         )
     }
 
@@ -514,15 +575,23 @@ final class PostureAnalyzer {
         return point
     }
 
-    private func collectOrientationSweepIfNeeded(from sampleBuffer: CMSampleBuffer) {
+    private func collectOrientationSweepIfNeeded(
+        from sampleBuffer: CMSampleBuffer,
+        mode: OrientationSweepMode
+    ) {
         #if DEBUG
-        guard calibrationOrientationSweepCount < calibrationOrientationSweepLimit else { return }
+        switch mode {
+        case .calibration:
+            guard calibrationOrientationSweepCount < calibrationOrientationSweepLimit else { return }
+            calibrationOrientationSweepCount += 1
+        case .tracking:
+            guard trackingOrientationSweepCount < trackingOrientationSweepLimit else { return }
+            trackingOrientationSweepCount += 1
+        }
 
-        // Calibration failures with a visible face but no body observations may be
-        // caused by passing the wrong EXIF orientation to Vision. Re-run the same
-        // frame with every orientation in debug builds only; this records evidence
-        // without changing posture or calibration behavior.
-        calibrationOrientationSweepCount += 1
+        // Visible face with unusable body geometry may be an EXIF orientation
+        // mismatch. Re-run the same frame with every orientation in debug builds
+        // only; this records evidence without changing posture decisions.
         lastFrameDiagnostics.orientationSweepResults = orientationSweepOptions.map {
             orientationDiagnostics(for: sampleBuffer, name: $0.name, orientation: $0.orientation)
         }
@@ -565,7 +634,8 @@ final class PostureAnalyzer {
                 shoulderWidth: nil,
                 neckDistance: nil,
                 candidateConfidence: nil,
-                rejectReason: "Vision failed: \(error.localizedDescription)"
+                rejectReason: "Vision failed: \(error.localizedDescription)",
+                observations: []
             )
         }
 
@@ -583,25 +653,41 @@ final class PostureAnalyzer {
                 shoulderWidth: nil,
                 neckDistance: nil,
                 candidateConfidence: nil,
-                rejectReason: "No body observations."
+                rejectReason: "No body observations.",
+                observations: []
             )
         }
 
         var bestProbe: RawBodyProbe?
         var validCandidateCount = 0
+        var observationDiagnostics: [PostureBodyObservationDiagnostics] = []
 
         for observation in observations {
             do {
                 let points = try observation.recognizedPoints(.all)
                 let probe: RawBodyProbe
+                let validCandidate: Bool
+                let rejectReason: String?
 
                 switch makeBodyCandidate(from: points, faceSignal: nil, now: Date()) {
                 case .success:
                     validCandidateCount += 1
+                    validCandidate = true
+                    rejectReason = nil
                     probe = rawBodyProbe(from: points, rejectReason: nil)
                 case .failure(let reason, _):
+                    validCandidate = false
+                    rejectReason = reason
                     probe = rawBodyProbe(from: points, rejectReason: reason)
                 }
+
+                observationDiagnostics.append(
+                    bodyObservationDiagnostics(
+                        from: points,
+                        validCandidate: validCandidate,
+                        rejectReason: rejectReason
+                    )
+                )
 
                 if bestProbe == nil || probe.score > bestProbe!.score {
                     bestProbe = probe
@@ -617,6 +703,16 @@ final class PostureAnalyzer {
                     neckDistance: nil,
                     candidateConfidence: nil,
                     rejectReason: "Vision joints unavailable."
+                )
+                observationDiagnostics.append(
+                    PostureBodyObservationDiagnostics(
+                        validCandidate: false,
+                        rejectReason: "Vision joints unavailable.",
+                        shoulderWidth: nil,
+                        neckDistance: nil,
+                        candidateConfidence: nil,
+                        joints: [:]
+                    )
                 )
 
                 if bestProbe == nil || probe.score > bestProbe!.score {
@@ -638,7 +734,8 @@ final class PostureAnalyzer {
             shoulderWidth: probe?.shoulderWidth,
             neckDistance: probe?.neckDistance,
             candidateConfidence: probe?.candidateConfidence,
-            rejectReason: probe?.rejectReason
+            rejectReason: probe?.rejectReason,
+            observations: observationDiagnostics
         )
     }
 
@@ -810,6 +907,9 @@ final class PostureAnalyzer {
         unreliableSince = nil
         lastReliableMetrics = nil
         lastReliablePose = nil
+        // A new baseline/run should collect fresh live failure evidence instead
+        // of keeping an old sweep-limit count.
+        trackingOrientationSweepCount = 0
         motionGate.reset()
     }
 

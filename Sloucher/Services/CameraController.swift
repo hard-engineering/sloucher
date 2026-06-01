@@ -95,8 +95,10 @@ final class CameraController: NSObject {
                 let input = try AVCaptureDeviceInput(device: device)
                 let output = AVCaptureVideoDataOutput()
                 output.alwaysDiscardsLateVideoFrames = true
+                // Feed Vision the camera's native YUV-style buffers instead of
+                // asking AVFoundation to convert every frame to BGRA for preview.
                 output.videoSettings = [
-                    kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+                    kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
                 ]
                 output.setSampleBufferDelegate(self, queue: videoQueue)
 
@@ -133,7 +135,9 @@ final class CameraController: NSObject {
                 if let connection = output.connection(with: .video),
                    connection.isVideoMirroringSupported {
                     connection.automaticallyAdjustsVideoMirroring = false
-                    connection.isVideoMirrored = true
+                    // Keep analysis buffers in camera-native geometry; the UI
+                    // mirrors only its preview so Vision is not fed a display transform.
+                    connection.isVideoMirrored = false
                 }
 
                 didConfigure = true

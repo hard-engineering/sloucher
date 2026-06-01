@@ -181,9 +181,25 @@ struct PostureFrameDiagnostics: Equatable {
     var rawRightShoulderConfidence: Double?
     var rawShoulderWidth: Double?
     var rawRejectReason: String?
+    var bodyObservations: [PostureBodyObservationDiagnostics] = []
     var orientationSweepResults: [PostureOrientationDiagnostics] = []
 
     static let empty = PostureFrameDiagnostics()
+}
+
+struct PostureJointDiagnostics: Codable, Equatable {
+    let x: Double
+    let y: Double
+    let confidence: Double
+}
+
+struct PostureBodyObservationDiagnostics: Codable, Equatable {
+    let validCandidate: Bool
+    let rejectReason: String?
+    let shoulderWidth: Double?
+    let neckDistance: Double?
+    let candidateConfidence: Double?
+    let joints: [String: PostureJointDiagnostics]
 }
 
 struct PostureOrientationDiagnostics: Codable, Equatable {
@@ -199,6 +215,7 @@ struct PostureOrientationDiagnostics: Codable, Equatable {
     let neckDistance: Double?
     let candidateConfidence: Double?
     let rejectReason: String?
+    let observations: [PostureBodyObservationDiagnostics]
 }
 
 struct PostureOrientationSweepDiagnostics: Codable, Equatable {
@@ -206,6 +223,79 @@ struct PostureOrientationSweepDiagnostics: Codable, Equatable {
     let timestamp: Date
     let results: [PostureOrientationDiagnostics]
     let bestOrientation: String?
+}
+
+struct PostureTrackingFrameDiagnostics: Codable, Equatable {
+    let frame: Int
+    let timestamp: Date
+    let status: String
+    let acceptedFrame: Bool
+    let reason: String?
+    let bodyObservationCount: Int
+    let validBodyCandidateCount: Int
+    let faceDetected: Bool
+    let candidateConfidence: Double?
+    let candidateShoulderWidth: Double?
+    let candidateNeckDistance: Double?
+    let rawNoseConfidence: Double?
+    let rawLeftShoulderConfidence: Double?
+    let rawRightShoulderConfidence: Double?
+    let rawShoulderWidth: Double?
+    let rawRejectReason: String?
+    let metricShoulderWidth: Double?
+    let metricNeckDistance: Double?
+    let metricCloseness: Double?
+}
+
+struct PostureTrackingSummaryDiagnostics: Codable, Equatable {
+    let frameCount: Int
+    let acceptedFrameCount: Int
+    let faceDetectedFrameCount: Int
+    let bodyObservationFrameCount: Int
+    let validCandidateFrameCount: Int
+    let noBodyObservationFrameCount: Int
+    let invalidBodyCandidateFrameCount: Int
+    let latestStatus: String?
+    let latestRejectReason: String?
+    let rawShoulderWidthMin: Double?
+    let rawShoulderWidthMedian: Double?
+    let rawShoulderWidthMax: Double?
+    let metricShoulderWidthMin: Double?
+    let metricShoulderWidthMedian: Double?
+    let metricShoulderWidthMax: Double?
+    let rejectReasonCounts: [String: Int]
+}
+
+struct PosturePixelBufferDiagnostics: Codable, Equatable {
+    let width: Int
+    let height: Int
+    let pixelFormat: String
+    let pixelFormatCode: UInt32
+    let isPlanar: Bool
+    let planeCount: Int
+    let bytesPerRow: [Int]
+    let planeWidths: [Int]
+    let planeHeights: [Int]
+    let presentationTimeSeconds: Double?
+}
+
+struct PostureForensicFrameReport: Codable, Equatable {
+    let role: String
+    let trackingFrame: PostureTrackingFrameDiagnostics
+    let pixelBuffer: PosturePixelBufferDiagnostics
+    let bodyObservations: [PostureBodyObservationDiagnostics]
+    let orientationSweepResults: [PostureOrientationDiagnostics]
+    let imageFile: String?
+    let rawFiles: [String]
+}
+
+struct PostureForensicSequenceReport: Codable, Equatable {
+    let capturedAt: Date
+    let trigger: String
+    let directory: String
+    let baselineShoulderWidth: Double?
+    let baselineNeckDistance: Double?
+    let frames: [PostureForensicFrameReport]
 }
 
 struct PostureDecisionConfig: Equatable {
