@@ -1,6 +1,25 @@
 import AppKit
 import SwiftUI
 
+struct MainWindowRootView: View {
+    @EnvironmentObject private var appState: AppState
+
+    var body: some View {
+        Group {
+            if appState.shouldShowPermissionSetup {
+                PermissionsSetupView()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+            } else {
+                ScrollView(.vertical) {
+                    MenuBarView()
+                        .frame(maxWidth: .infinity, alignment: .top)
+                }
+            }
+        }
+        .frame(minWidth: 700, minHeight: 540, alignment: .top)
+    }
+}
+
 struct MenuBarView: View {
     @EnvironmentObject private var appState: AppState
 
@@ -123,7 +142,7 @@ private struct InspectorHeader: View {
             StateBadge(status: appState.status, labelText: appState.statusBadgeText)
             NudgeIndicators(
                 firing: appState.status == .slouching || appState.isNudgePreviewActive,
-                notificationsEnabled: appState.settings.notificationsEnabled,
+                notificationsEnabled: appState.notificationNudgesEnabled,
                 soundEnabled: appState.settings.soundEnabled,
                 overlayEnabled: appState.settings.overlayEnabled
             )
@@ -188,7 +207,7 @@ private struct WebcamPreview: View {
                         Spacer()
                         NudgeIndicators(
                             firing: appState.status == .slouching || appState.isNudgePreviewActive,
-                            notificationsEnabled: appState.settings.notificationsEnabled,
+                            notificationsEnabled: appState.notificationNudgesEnabled,
                             soundEnabled: appState.settings.soundEnabled,
                             overlayEnabled: appState.settings.overlayEnabled,
                             compact: true
@@ -222,11 +241,40 @@ private struct EmptyPreviewMessage: View {
                 .multilineTextAlignment(.center)
                 .fixedSize(horizontal: false, vertical: true)
 
-            if appState.status == .cameraDenied {
+            switch appState.status {
+            case .cameraPermissionNeeded:
+                if appState.cameraAuthorization == .requesting {
+                    HStack(spacing: 6) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Waiting...")
+                            .font(.system(size: 11, weight: .medium))
+                    }
+                } else {
+                    Button("Enable Camera") {
+                        appState.requestCameraPermission()
+                    }
+                    .controlSize(.small)
+                }
+            case .cameraDenied:
                 Button("Open System Settings") {
                     appState.openCameraSettings()
                 }
                 .controlSize(.small)
+            case .cameraStarting:
+                HStack(spacing: 6) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Starting...")
+                        .font(.system(size: 11, weight: .medium))
+                }
+            case .cameraNoFrames:
+                Button("Open System Settings") {
+                    appState.openCameraSettings()
+                }
+                .controlSize(.small)
+            default:
+                EmptyView()
             }
         }
         .padding(18)
@@ -234,7 +282,7 @@ private struct EmptyPreviewMessage: View {
 
     private var iconName: String {
         switch appState.status {
-        case .cameraDenied, .cameraUnavailable:
+        case .cameraPermissionNeeded, .cameraDenied, .cameraStarting, .cameraNoFrames, .cameraUnavailable:
             "video.slash"
         case .cannotSee:
             "eye.slash"
@@ -245,8 +293,16 @@ private struct EmptyPreviewMessage: View {
 
     private var message: String {
         switch appState.status {
+        case .cameraPermissionNeeded:
+            appState.cameraAuthorization == .requesting
+                ? "Waiting for camera permission..."
+                : "Camera access is needed."
         case .cameraDenied:
             "Camera access is off."
+        case .cameraStarting:
+            "Starting the camera..."
+        case .cameraNoFrames:
+            "Camera is enabled, but no frames are arriving."
         case .cameraUnavailable:
             "No camera was found."
         case .cannotSee:
@@ -836,55 +892,126 @@ private struct InspectorControls: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 12) {
-                Button {
-                    appState.startCalibration()
-                } label: {
-                    Label(appState.hasBaseline ? "Recalibrate" : "Calibrate", systemImage: "scope")
-                        .fixedSize(horizontal: true, vertical: false)
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 12) {
+                    calibrationButton
+                    sensitivityLabel
+                    sensitivitySlider
+                    sensitivityValue
+                    Spacer(minLength: 0)
                 }
-                .disabled(!appState.canCalibrate)
-                .help(appState.hasBaseline ? "Recalibrate posture baseline" : "Calibrate posture baseline")
 
-                Text("Sensitivity")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: true, vertical: false)
-                    .help("Sensitivity")
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 12) {
+                        calibrationButton
+                        sensitivityLabel
+                        Spacer(minLength: 0)
+                    }
 
-                Slider(value: sensitivityBinding, in: 0...2, step: 1)
-                    .frame(minWidth: 190)
-                    .accessibilityLabel("Sensitivity")
-                    .accessibilityValue(sensitivityText)
-                    .help("Move right for stricter posture alerts")
-
-                Text(sensitivityText)
-                    .font(.system(size: 12, weight: .medium, design: .monospaced))
-                    .fixedSize(horizontal: true, vertical: false)
-                    .help(sensitivityText)
-
-                Spacer(minLength: 0)
+                    HStack(spacing: 12) {
+                        sensitivitySlider
+                        sensitivityValue
+                    }
+                }
             }
 
-            HStack(spacing: 18) {
-                Toggle("Notifications", isOn: $appState.settings.notificationsEnabled)
-                    .toggleStyle(.checkbox)
-                    .fixedSize(horizontal: true, vertical: false)
-                    .help("Notifications")
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 18) {
+                    notificationToggle
+                    notificationPermissionAction
+                    soundToggle
+                    screenGlowToggle
+                    Spacer(minLength: 0)
+                }
 
-                Toggle("Sound", isOn: $appState.settings.soundEnabled)
-                    .toggleStyle(.checkbox)
-                    .fixedSize(horizontal: true, vertical: false)
-                    .help("Sound")
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 18) {
+                        notificationToggle
+                        notificationPermissionAction
+                        Spacer(minLength: 0)
+                    }
 
-                Toggle("Screen glow", isOn: $appState.settings.overlayEnabled)
-                    .toggleStyle(.checkbox)
-                    .fixedSize(horizontal: true, vertical: false)
-                    .help("Screen glow")
-
-                Spacer(minLength: 0)
+                    HStack(spacing: 18) {
+                        soundToggle
+                        screenGlowToggle
+                        Spacer(minLength: 0)
+                    }
+                }
             }
         }
+    }
+
+    private var calibrationButton: some View {
+        Button {
+            appState.startCalibration()
+        } label: {
+            Label(appState.hasBaseline ? "Recalibrate" : "Calibrate", systemImage: "scope")
+                .fixedSize(horizontal: true, vertical: false)
+        }
+        .disabled(!appState.canCalibrate)
+        .help(appState.hasBaseline ? "Recalibrate posture baseline" : "Calibrate posture baseline")
+    }
+
+    private var sensitivityLabel: some View {
+        Text("Sensitivity")
+            .font(.system(size: 12))
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: true, vertical: false)
+            .help("Sensitivity")
+    }
+
+    private var sensitivitySlider: some View {
+        Slider(value: sensitivityBinding, in: 0...2, step: 1)
+            .frame(minWidth: 190)
+            .accessibilityLabel("Sensitivity")
+            .accessibilityValue(sensitivityText)
+            .help("Move right for stricter posture alerts")
+    }
+
+    private var sensitivityValue: some View {
+        Text(sensitivityText)
+            .font(.system(size: 12, weight: .medium, design: .monospaced))
+            .fixedSize(horizontal: true, vertical: false)
+            .help(sensitivityText)
+    }
+
+    private var notificationToggle: some View {
+        Toggle("Notifications", isOn: $appState.settings.notificationsEnabled)
+            .toggleStyle(.checkbox)
+            .fixedSize(horizontal: true, vertical: false)
+            .help("Notifications")
+            .onChange(of: appState.settings.notificationsEnabled) { enabled in
+                if enabled {
+                    appState.requestNotificationPermissionIfNeeded()
+                }
+            }
+    }
+
+    @ViewBuilder
+    private var notificationPermissionAction: some View {
+        if appState.settings.notificationsEnabled,
+           appState.notificationPermissionStatus == .denied {
+            Button("Settings") {
+                appState.openNotificationSettings()
+            }
+            .controlSize(.small)
+            .fixedSize(horizontal: true, vertical: false)
+            .help("Open Notification settings")
+        }
+    }
+
+    private var soundToggle: some View {
+        Toggle("Sound", isOn: $appState.settings.soundEnabled)
+            .toggleStyle(.checkbox)
+            .fixedSize(horizontal: true, vertical: false)
+            .help("Sound")
+    }
+
+    private var screenGlowToggle: some View {
+        Toggle("Screen glow", isOn: $appState.settings.overlayEnabled)
+            .toggleStyle(.checkbox)
+            .fixedSize(horizontal: true, vertical: false)
+            .help("Screen glow")
     }
 
     private var sensitivityBinding: Binding<Double> {
@@ -908,39 +1035,80 @@ private struct UtilityControls: View {
     @EnvironmentObject private var appState: AppState
 
     var body: some View {
-        HStack(spacing: 10) {
-            Toggle("Launch at login", isOn: $appState.launchAtLoginEnabled)
-                .toggleStyle(.checkbox)
-                .fixedSize(horizontal: true, vertical: false)
-                .help("Launch at login")
-
-            Spacer()
-
-            Button(appState.isPaused ? "Resume" : "Pause") {
-                appState.togglePause()
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 10) {
+                launchAtLoginToggle
+                Spacer()
+                utilityButtons
             }
-            .fixedSize(horizontal: true, vertical: false)
-            .help(appState.isPaused ? "Resume monitoring" : "Pause monitoring")
 
-            Button("Snooze 20 min") {
-                appState.snooze(minutes: 20)
+            VStack(alignment: .leading, spacing: 8) {
+                launchAtLoginToggle
+                utilityButtons
             }
-            .fixedSize(horizontal: true, vertical: false)
-            .help("Snooze for 20 minutes")
-
-            Button("Test nudge") {
-                appState.testNudge()
-            }
-            .fixedSize(horizontal: true, vertical: false)
-            .help("Test notification, sound, and screen glow")
-
-            Button("Quit") {
-                appState.quit()
-            }
-            .keyboardShortcut("q")
-            .fixedSize(horizontal: true, vertical: false)
-            .help("Quit Sloucher")
         }
+    }
+
+    private var launchAtLoginToggle: some View {
+        Toggle("Launch at login", isOn: $appState.launchAtLoginEnabled)
+            .toggleStyle(.checkbox)
+            .fixedSize(horizontal: true, vertical: false)
+            .help("Launch at login")
+    }
+
+    private var utilityButtons: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 10) {
+                pauseButton
+                snoozeButton
+                testNudgeButton
+                quitButton
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 10) {
+                    pauseButton
+                    snoozeButton
+                }
+                HStack(spacing: 10) {
+                    testNudgeButton
+                    quitButton
+                }
+            }
+        }
+    }
+
+    private var pauseButton: some View {
+        Button(appState.isPaused ? "Resume" : "Pause") {
+            appState.togglePause()
+        }
+        .fixedSize(horizontal: true, vertical: false)
+        .help(appState.isPaused ? "Resume monitoring" : "Pause monitoring")
+    }
+
+    private var snoozeButton: some View {
+        Button("Snooze 20 min") {
+            appState.snooze(minutes: 20)
+        }
+        .fixedSize(horizontal: true, vertical: false)
+        .help("Snooze for 20 minutes")
+    }
+
+    private var testNudgeButton: some View {
+        Button("Test nudge") {
+            appState.testNudge()
+        }
+        .fixedSize(horizontal: true, vertical: false)
+        .help("Test notification, sound, and screen glow")
+    }
+
+    private var quitButton: some View {
+        Button("Quit") {
+            appState.quit()
+        }
+        .keyboardShortcut("q")
+        .fixedSize(horizontal: true, vertical: false)
+        .help("Quit Sloucher")
     }
 }
 
@@ -974,7 +1142,7 @@ private struct StateBadge: View {
             "arrow.triangle.2.circlepath"
         case .cannotSee:
             "viewfinder"
-        case .cameraDenied, .cameraUnavailable:
+        case .cameraPermissionNeeded, .cameraDenied, .cameraStarting, .cameraNoFrames, .cameraUnavailable:
             "video.slash"
         case .paused, .snoozed:
             "pause.circle.fill"
@@ -991,7 +1159,8 @@ private struct StateBadge: View {
             InspectorColors.slouch
         case .calibrating:
             InspectorColors.info
-        case .cannotSee, .paused, .snoozed, .uncalibrated, .cameraDenied, .cameraUnavailable:
+        case .cannotSee, .paused, .snoozed, .uncalibrated,
+             .cameraPermissionNeeded, .cameraDenied, .cameraStarting, .cameraNoFrames, .cameraUnavailable:
             .secondary
         }
     }
@@ -1120,6 +1289,182 @@ private struct NudgeIndicators: View {
         }
 
         return enabled ? "\(name) nudge enabled" : "\(name) nudge disabled"
+    }
+}
+
+private struct PermissionsSetupView: View {
+    @EnvironmentObject private var appState: AppState
+
+    var body: some View {
+        VStack(spacing: 18) {
+            VStack(spacing: 8) {
+                Image(nsImage: NSApp.applicationIconImage)
+                    .resizable()
+                    .frame(width: 58, height: 58)
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+
+                Text("Sloucher")
+                    .font(.system(size: 24, weight: .semibold))
+                    .fixedSize(horizontal: true, vertical: false)
+
+                Text("Set Up Sloucher")
+                    .font(.system(size: 15, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: true, vertical: false)
+
+                Text("Camera access is required for posture detection.")
+                    .font(.system(size: 13))
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            VStack(spacing: 10) {
+                PermissionCard(
+                    iconName: "camera.fill",
+                    title: "Camera",
+                    description: "Measures posture locally from your Mac camera.",
+                    state: cameraCardState,
+                    primaryAction: cameraPrimaryAction,
+                    settingsAction: appState.openCameraSettings
+                )
+            }
+        }
+        .padding(24)
+        .frame(maxWidth: 520)
+    }
+
+    private var cameraCardState: PermissionCardState {
+        switch appState.cameraAuthorization {
+        case .notDetermined:
+            .needed(buttonTitle: "Enable Camera")
+        case .requesting:
+            .requesting
+        case .authorized:
+            .granted
+        case .denied:
+            .denied(buttonTitle: "Open System Settings")
+        case .unavailable:
+            .unavailable
+        }
+    }
+
+    private var cameraPrimaryAction: () -> Void {
+        switch appState.cameraAuthorization {
+        case .notDetermined:
+            return appState.requestCameraPermission
+        case .denied:
+            return appState.openCameraSettings
+        default:
+            return {}
+        }
+    }
+}
+
+private enum PermissionCardState: Equatable {
+    case needed(buttonTitle: String)
+    case requesting
+    case granted
+    case denied(buttonTitle: String)
+    case unavailable
+}
+
+private struct PermissionCard: View {
+    let iconName: String
+    let title: String
+    let description: String
+    let state: PermissionCardState
+    let primaryAction: () -> Void
+    let settingsAction: () -> Void
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 12) {
+            ZStack {
+                Circle()
+                    .fill(iconFill.opacity(0.16))
+
+                Image(systemName: iconName)
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(iconFill)
+            }
+            .frame(width: 42, height: 42)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .font(.system(size: 14, weight: .semibold))
+                    .fixedSize(horizontal: true, vertical: false)
+
+                Text(description)
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Spacer(minLength: 8)
+
+            trailingView
+        }
+        .padding(12)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color.secondary.opacity(0.14), lineWidth: 1)
+        )
+    }
+
+    @ViewBuilder
+    private var trailingView: some View {
+        switch state {
+        case let .needed(buttonTitle):
+            Button(buttonTitle) {
+                primaryAction()
+            }
+            .controlSize(.small)
+            .fixedSize(horizontal: true, vertical: false)
+        case .requesting:
+            VStack(alignment: .trailing, spacing: 4) {
+                HStack(spacing: 6) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Waiting...")
+                        .font(.system(size: 12, weight: .medium))
+                        .fixedSize(horizontal: true, vertical: false)
+                }
+
+                Button("Open System Settings") {
+                    settingsAction()
+                }
+                .buttonStyle(.link)
+                .font(.system(size: 12))
+            }
+        case .granted:
+            Label("Granted", systemImage: "checkmark.circle.fill")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(InspectorColors.goodText)
+                .fixedSize(horizontal: true, vertical: false)
+        case let .denied(buttonTitle):
+            Button(buttonTitle) {
+                settingsAction()
+            }
+            .controlSize(.small)
+            .fixedSize(horizontal: true, vertical: false)
+        case .unavailable:
+            Text("No camera found")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: true, vertical: false)
+        }
+    }
+
+    private var iconFill: Color {
+        switch state {
+        case .granted:
+            InspectorColors.good
+        case .requesting:
+            InspectorColors.info
+        default:
+            InspectorColors.warn
+        }
     }
 }
 

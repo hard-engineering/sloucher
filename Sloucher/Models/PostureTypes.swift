@@ -9,7 +9,10 @@ enum PostureStatus: String, CaseIterable {
     case snoozed
     case calibrating
     case cannotSee
+    case cameraPermissionNeeded
     case cameraDenied
+    case cameraStarting
+    case cameraNoFrames
     case cameraUnavailable
 
     var displayName: String {
@@ -21,7 +24,10 @@ enum PostureStatus: String, CaseIterable {
         case .snoozed: "Snoozed"
         case .calibrating: "Calibrating"
         case .cannotSee: "Posture not measurable"
+        case .cameraPermissionNeeded: "Camera needed"
         case .cameraDenied: "Camera denied"
+        case .cameraStarting: "Camera starting"
+        case .cameraNoFrames: "Camera waiting"
         case .cameraUnavailable: "No camera"
         }
     }
@@ -33,7 +39,7 @@ enum PostureStatus: String, CaseIterable {
         case .paused, .snoozed: "pause.circle"
         case .calibrating: "camera.metering.center.weighted"
         case .cannotSee: "viewfinder"
-        case .cameraDenied, .cameraUnavailable: "video.slash"
+        case .cameraPermissionNeeded, .cameraDenied, .cameraStarting, .cameraNoFrames, .cameraUnavailable: "video.slash"
         case .uncalibrated: "figure.stand"
         }
     }
@@ -168,6 +174,9 @@ struct PostureFrameDiagnostics: Equatable {
     var bodyObservationCount: Int = 0
     var validBodyCandidateCount: Int = 0
     var faceDetected: Bool = false
+    var faceObservationCount: Int = 0
+    var faceBox: PostureRectDiagnostics?
+    var faceConfidence: Double?
     var bodyFailureReason: String?
     var headAnchorSource: String?
     var bestCandidateScore: Double?
@@ -181,6 +190,19 @@ struct PostureFrameDiagnostics: Equatable {
     var rawRightShoulderConfidence: Double?
     var rawShoulderWidth: Double?
     var rawRejectReason: String?
+    var forceInference: Bool = false
+    var motionGateSkipped: Bool = false
+    var motionGateMeanAbsoluteDifference: Double?
+    var motionGateThreshold: Double?
+    var motionGateHadPreviousFrame: Bool = false
+    var motionGateFrameHash: String?
+    var consecutiveFailureFrameCount: Int = 0
+    var forcedVisionAttemptsSinceFailure: Int = 0
+    var orientationRetryBestOrientation: String?
+    var orientationRetryBestValidCandidateCount: Int?
+    var orientationRetryUpMirroredValidCandidateCount: Int?
+    var orientationRetryUpMirroredShoulderWidth: Double?
+    var orientationRetryUpMirroredRejectReason: String?
     var bodyObservations: [PostureBodyObservationDiagnostics] = []
     var orientationSweepResults: [PostureOrientationDiagnostics] = []
 
@@ -193,12 +215,28 @@ struct PostureJointDiagnostics: Codable, Equatable {
     let confidence: Double
 }
 
+struct PostureRectDiagnostics: Codable, Equatable {
+    let minX: Double
+    let minY: Double
+    let maxX: Double
+    let maxY: Double
+}
+
+struct PosturePointDeltaDiagnostics: Codable, Equatable {
+    let dx: Double
+    let dy: Double
+    let distance: Double
+}
+
 struct PostureBodyObservationDiagnostics: Codable, Equatable {
     let validCandidate: Bool
     let rejectReason: String?
     let shoulderWidth: Double?
     let neckDistance: Double?
     let candidateConfidence: Double?
+    let bodyBox: PostureRectDiagnostics?
+    let headToFaceDelta: PosturePointDeltaDiagnostics?
+    let shoulderMidToFaceDelta: PosturePointDeltaDiagnostics?
     let joints: [String: PostureJointDiagnostics]
 }
 
@@ -228,12 +266,19 @@ struct PostureOrientationSweepDiagnostics: Codable, Equatable {
 struct PostureTrackingFrameDiagnostics: Codable, Equatable {
     let frame: Int
     let timestamp: Date
+    let presentationTimeSeconds: Double?
+    let lumaSampleHash: String?
+    let lumaSampleChecksum: Int?
     let status: String
     let acceptedFrame: Bool
     let reason: String?
     let bodyObservationCount: Int
     let validBodyCandidateCount: Int
+    let bodyObservations: [PostureBodyObservationDiagnostics]
     let faceDetected: Bool
+    let faceObservationCount: Int
+    let faceBox: PostureRectDiagnostics?
+    let faceConfidence: Double?
     let candidateConfidence: Double?
     let candidateShoulderWidth: Double?
     let candidateNeckDistance: Double?
@@ -245,6 +290,19 @@ struct PostureTrackingFrameDiagnostics: Codable, Equatable {
     let metricShoulderWidth: Double?
     let metricNeckDistance: Double?
     let metricCloseness: Double?
+    let forceInference: Bool
+    let motionGateSkipped: Bool
+    let motionGateMeanAbsoluteDifference: Double?
+    let motionGateThreshold: Double?
+    let motionGateHadPreviousFrame: Bool
+    let motionGateFrameHash: String?
+    let consecutiveFailureFrameCount: Int
+    let forcedVisionAttemptsSinceFailure: Int
+    let orientationRetryBestOrientation: String?
+    let orientationRetryBestValidCandidateCount: Int?
+    let orientationRetryUpMirroredValidCandidateCount: Int?
+    let orientationRetryUpMirroredShoulderWidth: Double?
+    let orientationRetryUpMirroredRejectReason: String?
 }
 
 struct PostureTrackingSummaryDiagnostics: Codable, Equatable {
@@ -255,6 +313,10 @@ struct PostureTrackingSummaryDiagnostics: Codable, Equatable {
     let validCandidateFrameCount: Int
     let noBodyObservationFrameCount: Int
     let invalidBodyCandidateFrameCount: Int
+    let motionSkippedFrameCount: Int
+    let forcedInferenceFrameCount: Int
+    let uniqueLumaHashCount: Int
+    let latestPresentationTimeSeconds: Double?
     let latestStatus: String?
     let latestRejectReason: String?
     let rawShoulderWidthMin: Double?
@@ -277,6 +339,13 @@ struct PosturePixelBufferDiagnostics: Codable, Equatable {
     let planeWidths: [Int]
     let planeHeights: [Int]
     let presentationTimeSeconds: Double?
+}
+
+struct PostureFrameIdentityDiagnostics: Codable, Equatable {
+    let lumaSampleHash: String
+    let lumaSampleChecksum: Int
+    let lumaSampleWidth: Int
+    let lumaSampleHeight: Int
 }
 
 struct PostureForensicFrameReport: Codable, Equatable {

@@ -1,0 +1,7 @@
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Sloucher rise icon">
+  <rect x="0" y="0" width="512" height="512" rx="112" fill="#FB6B4B"/>
+  <circle cx="256" cy="120" r="22" fill="#ffffff"/>
+  <path d="M186 228 L256 170 L326 228" fill="none" stroke="#ffffff" stroke-width="34" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M160 328 L256 250 L352 328" fill="none" stroke="#ffffff" stroke-width="34" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M134 430 L256 338 L378 430" fill="none" stroke="#ffffff" stroke-width="34" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

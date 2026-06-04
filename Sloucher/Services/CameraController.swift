@@ -3,6 +3,8 @@ import CoreMedia
 import Foundation
 
 enum CameraAuthorization: Equatable {
+    case notDetermined
+    case requesting
     case authorized
     case denied
     case unavailable
@@ -12,6 +14,7 @@ final class CameraController: NSObject {
     var sampleIntervalProvider: () -> TimeInterval = { 1.5 }
     var onFrame: ((CMSampleBuffer) -> Void)?
     var onAuthorizationChange: ((CameraAuthorization) -> Void)?
+    var onAuthorizationRequestFinished: (() -> Void)?
 
     private let session = AVCaptureSession()
     private let sessionQueue = DispatchQueue(label: "app.sloucher.camera.session")
@@ -24,18 +27,35 @@ final class CameraController: NSObject {
     private var shouldForceNextFrame = false
     private var currentAuthorization: CameraAuthorization?
 
+    func refreshAuthorizationAndConfigureIfAllowed() {
+        switch AVCaptureDevice.authorizationStatus(for: .video) {
+        case .authorized:
+            configureSession()
+        case .notDetermined:
+            updateAuthorization(currentAuthorization == .requesting ? .requesting : .notDetermined)
+        case .denied, .restricted:
+            updateAuthorization(.denied)
+        @unknown default:
+            updateAuthorization(.denied)
+        }
+    }
+
     func requestAuthorizationAndConfigure() {
         switch AVCaptureDevice.authorizationStatus(for: .video) {
         case .authorized:
             configureSession()
         case .notDetermined:
+            updateAuthorization(.requesting)
             AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
                 guard let self else { return }
                 if granted {
                     self.configureSession()
                 } else {
-                    self.updateAuthorization(.denied)
+                    // The native sheet can be dismissed without changing TCC;
+                    // read the actual system status before changing UI state.
+                    self.updateAuthorizationFromSystemStatus(preserveRequesting: false)
                 }
+                self.onAuthorizationRequestFinished?()
             }
         case .denied, .restricted:
             updateAuthorization(.denied)
@@ -150,6 +170,19 @@ final class CameraController: NSObject {
     private func startSessionIfNeeded() {
         guard shouldRun, isConfigured, !session.isRunning else { return }
         session.startRunning()
+    }
+
+    private func updateAuthorizationFromSystemStatus(preserveRequesting: Bool) {
+        switch AVCaptureDevice.authorizationStatus(for: .video) {
+        case .authorized:
+            configureSession()
+        case .notDetermined:
+            updateAuthorization(preserveRequesting && currentAuthorization == .requesting ? .requesting : .notDetermined)
+        case .denied, .restricted:
+            updateAuthorization(.denied)
+        @unknown default:
+            updateAuthorization(.denied)
+        }
     }
 
     private func updateAuthorization(_ authorization: CameraAuthorization) {

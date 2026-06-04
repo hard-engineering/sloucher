@@ -24,6 +24,8 @@ final class PostureAnalyzer {
     private var lastReliablePose: PoseFrame?
     private var calibrationOrientationSweepCount = 0
     private var trackingOrientationSweepCount = 0
+    private var consecutiveFailureFrameCount = 0
+    private var forcedVisionAttemptsSinceFailure = 0
 
     private enum OrientationSweepMode {
         case calibration
@@ -74,6 +76,7 @@ final class PostureAnalyzer {
         let centerY: Double
         let width: Double
         let height: Double
+        let box: PostureRectDiagnostics
         let confidence: Float
     }
 
@@ -87,9 +90,15 @@ final class PostureAnalyzer {
         let now = Date()
         lastFrameDiagnostics = .empty
         let shouldForceInference = forceInference || unreliableSince != nil || currentStatus == .cannotSee
+        let gateDiagnostics = motionGate.evaluate(
+            sampleBuffer: sampleBuffer,
+            forceInference: shouldForceInference
+        )
+        recordMotionGateDiagnostics(gateDiagnostics)
 
-        guard motionGate.shouldRunInference(sampleBuffer: sampleBuffer, forceInference: shouldForceInference) else {
+        guard gateDiagnostics.shouldRunInference else {
             lastFrameDiagnostics.bodyFailureReason = "Motion gate skipped inference."
+            recordFailureRunDiagnostics()
             return handleMotionSkippedFrame(config: config, now: now)
         }
 
@@ -103,6 +112,14 @@ final class PostureAnalyzer {
             unreliableSince = nil
             lastReliableMetrics = metrics
             lastReliablePose = pose
+            consecutiveFailureFrameCount = 0
+            forcedVisionAttemptsSinceFailure = 0
+            recordFailureRunDiagnostics()
+            #if DEBUG
+            // A valid frame starts a new diagnostic episode; future visible-face
+            // failures should still get orientation retry evidence.
+            trackingOrientationSweepCount = 0
+            #endif
             let status = decideStatus(for: metrics, config: config, now: now)
 
             return PostureAnalysisResult(
@@ -114,6 +131,11 @@ final class PostureAnalyzer {
             )
 
         case .failure(let reason, let pose):
+            consecutiveFailureFrameCount += 1
+            if shouldForceInference {
+                forcedVisionAttemptsSinceFailure += 1
+            }
+            recordFailureRunDiagnostics()
             return handleUnreliableFrame(reason: reason, pose: pose, config: config, now: now)
         }
     }
@@ -124,6 +146,20 @@ final class PostureAnalyzer {
 
     func resetTrackingDebugDiagnostics() {
         trackingOrientationSweepCount = 0
+    }
+
+    private func recordMotionGateDiagnostics(_ diagnostics: FrameMotionGateDiagnostics) {
+        lastFrameDiagnostics.forceInference = diagnostics.forceInference
+        lastFrameDiagnostics.motionGateSkipped = diagnostics.skipped
+        lastFrameDiagnostics.motionGateMeanAbsoluteDifference = diagnostics.meanAbsoluteDifference
+        lastFrameDiagnostics.motionGateThreshold = diagnostics.threshold
+        lastFrameDiagnostics.motionGateHadPreviousFrame = diagnostics.hadPreviousFrame
+        lastFrameDiagnostics.motionGateFrameHash = diagnostics.frameHash
+    }
+
+    private func recordFailureRunDiagnostics() {
+        lastFrameDiagnostics.consecutiveFailureFrameCount = consecutiveFailureFrameCount
+        lastFrameDiagnostics.forcedVisionAttemptsSinceFailure = forcedVisionAttemptsSinceFailure
     }
 
     private func extractMetrics(
@@ -149,7 +185,11 @@ final class PostureAnalyzer {
             rectanglesRequest: faceRequest,
             landmarksRequest: faceLandmarksRequest
         )
+        lastFrameDiagnostics.faceObservationCount =
+            (faceRequest.results?.count ?? 0) + (faceLandmarksRequest.results?.count ?? 0)
         lastFrameDiagnostics.faceDetected = faceSignal != nil
+        lastFrameDiagnostics.faceBox = faceSignal?.box
+        lastFrameDiagnostics.faceConfidence = faceSignal.map { Double($0.confidence) }
         let facePose = faceSignal.map { makeFacePose(from: $0, now: now) }
 
         switch makeBodyMetrics(from: bodyRequest, faceSignal: faceSignal, now: now) {
@@ -189,7 +229,12 @@ final class PostureAnalyzer {
                 case .success(let metrics, let pose):
                     recordRawBodyProbe(rawBodyProbe(from: points, rejectReason: nil))
                     lastFrameDiagnostics.bodyObservations.append(
-                        bodyObservationDiagnostics(from: points, validCandidate: true, rejectReason: nil)
+                        bodyObservationDiagnostics(
+                            from: points,
+                            validCandidate: true,
+                            rejectReason: nil,
+                            faceSignal: faceSignal
+                        )
                     )
                     let pose = pose ?? makePosePlaceholder(metrics: metrics, now: now)
                     candidates.append(
@@ -203,7 +248,12 @@ final class PostureAnalyzer {
                 case .failure(let reason, _):
                     recordRawBodyProbe(rawBodyProbe(from: points, rejectReason: reason))
                     lastFrameDiagnostics.bodyObservations.append(
-                        bodyObservationDiagnostics(from: points, validCandidate: false, rejectReason: reason)
+                        bodyObservationDiagnostics(
+                            from: points,
+                            validCandidate: false,
+                            rejectReason: reason,
+                            faceSignal: faceSignal
+                        )
                     )
                     lastFailureReason = reason
                 }
@@ -215,6 +265,9 @@ final class PostureAnalyzer {
                         shoulderWidth: nil,
                         neckDistance: nil,
                         candidateConfidence: nil,
+                        bodyBox: nil,
+                        headToFaceDelta: nil,
+                        shoulderMidToFaceDelta: nil,
                         joints: [:]
                     )
                 )
@@ -355,18 +408,29 @@ final class PostureAnalyzer {
     private func bodyObservationDiagnostics(
         from points: [VNHumanBodyPoseObservation.JointName: VNRecognizedPoint],
         validCandidate: Bool,
-        rejectReason: String?
+        rejectReason: String?,
+        faceSignal: FaceSignal? = nil
     ) -> PostureBodyObservationDiagnostics {
         let probe = rawBodyProbe(from: points, rejectReason: rejectReason)
         var joints: [String: PostureJointDiagnostics] = [:]
+        var finitePoints: [CGPoint] = []
 
         for (joint, point) in points {
             guard point.location.x.isFinite, point.location.y.isFinite else { continue }
+            finitePoints.append(point.location)
             joints[String(describing: joint)] = PostureJointDiagnostics(
                 x: Double(point.location.x),
                 y: Double(point.location.y),
                 confidence: Double(point.confidence)
             )
+        }
+
+        let faceCenter = faceSignal.map { CGPoint(x: $0.centerX, y: $0.centerY) }
+        let headDelta = faceCenter.flatMap { faceCenter in
+            diagnosticHeadPoint(in: points).map { pointDelta(from: $0, to: faceCenter) }
+        }
+        let shoulderDelta = faceCenter.flatMap { faceCenter in
+            diagnosticShoulderMidPoint(in: points).map { pointDelta(from: $0, to: faceCenter) }
         }
 
         return PostureBodyObservationDiagnostics(
@@ -375,7 +439,84 @@ final class PostureAnalyzer {
             shoulderWidth: probe.shoulderWidth,
             neckDistance: probe.neckDistance,
             candidateConfidence: probe.candidateConfidence,
+            bodyBox: bodyBox(from: finitePoints),
+            headToFaceDelta: headDelta,
+            shoulderMidToFaceDelta: shoulderDelta,
             joints: joints
+        )
+    }
+
+    private func diagnosticHeadPoint(
+        in points: [VNHumanBodyPoseObservation.JointName: VNRecognizedPoint]
+    ) -> CGPoint? {
+        if let nose = rawPoint(.nose, in: points) {
+            return nose.location
+        }
+
+        let leftEye = rawPoint(.leftEye, in: points)
+        let rightEye = rawPoint(.rightEye, in: points)
+
+        switch (leftEye, rightEye) {
+        case (.some(let leftEye), .some(let rightEye)):
+            return CGPoint(
+                x: (leftEye.location.x + rightEye.location.x) / 2,
+                y: (leftEye.location.y + rightEye.location.y) / 2
+            )
+        case (.some(let leftEye), nil):
+            return leftEye.location
+        case (nil, .some(let rightEye)):
+            return rightEye.location
+        case (nil, nil):
+            return nil
+        }
+    }
+
+    private func diagnosticShoulderMidPoint(
+        in points: [VNHumanBodyPoseObservation.JointName: VNRecognizedPoint]
+    ) -> CGPoint? {
+        guard
+            let leftShoulder = rawPoint(.leftShoulder, in: points),
+            let rightShoulder = rawPoint(.rightShoulder, in: points)
+        else {
+            return nil
+        }
+
+        return CGPoint(
+            x: (leftShoulder.location.x + rightShoulder.location.x) / 2,
+            y: (leftShoulder.location.y + rightShoulder.location.y) / 2
+        )
+    }
+
+    private func pointDelta(from point: CGPoint, to target: CGPoint) -> PosturePointDeltaDiagnostics {
+        let dx = Double(point.x - target.x)
+        let dy = Double(point.y - target.y)
+        return PosturePointDeltaDiagnostics(
+            dx: dx,
+            dy: dy,
+            distance: sqrt(dx * dx + dy * dy)
+        )
+    }
+
+    private func bodyBox(from points: [CGPoint]) -> PostureRectDiagnostics? {
+        guard let first = points.first else { return nil }
+
+        var minX = first.x
+        var minY = first.y
+        var maxX = first.x
+        var maxY = first.y
+
+        for point in points.dropFirst() {
+            minX = min(minX, point.x)
+            minY = min(minY, point.y)
+            maxX = max(maxX, point.x)
+            maxY = max(maxY, point.y)
+        }
+
+        return PostureRectDiagnostics(
+            minX: Double(minX),
+            minY: Double(minY),
+            maxX: Double(maxX),
+            maxY: Double(maxY)
         )
     }
 
@@ -511,6 +652,12 @@ final class PostureAnalyzer {
             centerY: Double(box.midY),
             width: Double(box.width),
             height: Double(box.height),
+            box: PostureRectDiagnostics(
+                minX: Double(box.minX),
+                minY: Double(box.minY),
+                maxX: Double(box.maxX),
+                maxY: Double(box.maxY)
+            ),
             confidence: face.confidence
         )
     }
@@ -595,7 +742,38 @@ final class PostureAnalyzer {
         lastFrameDiagnostics.orientationSweepResults = orientationSweepOptions.map {
             orientationDiagnostics(for: sampleBuffer, name: $0.name, orientation: $0.orientation)
         }
+        recordOrientationRetrySummary()
         #endif
+    }
+
+    private func recordOrientationRetrySummary() {
+        let results = lastFrameDiagnostics.orientationSweepResults
+        guard !results.isEmpty else { return }
+
+        let best = results.max { first, second in
+            orientationScore(first) < orientationScore(second)
+        }
+        let upMirrored = results.first { $0.orientation == "upMirrored" }
+
+        lastFrameDiagnostics.orientationRetryBestOrientation = best?.orientation
+        lastFrameDiagnostics.orientationRetryBestValidCandidateCount = best?.validBodyCandidateCount
+        lastFrameDiagnostics.orientationRetryUpMirroredValidCandidateCount = upMirrored?.validBodyCandidateCount
+        lastFrameDiagnostics.orientationRetryUpMirroredShoulderWidth = upMirrored?.shoulderWidth
+        lastFrameDiagnostics.orientationRetryUpMirroredRejectReason = upMirrored?.rejectReason
+    }
+
+    private func orientationScore(_ result: PostureOrientationDiagnostics) -> Double {
+        let confidence = result.candidateConfidence ??
+            result.leftShoulderConfidence ??
+            result.rightShoulderConfidence ??
+            result.noseConfidence ??
+            0
+        let shoulderWidth = result.shoulderWidth ?? 0
+
+        return Double(result.validBodyCandidateCount) * 1000 +
+            Double(result.bodyObservationCount) * 100 +
+            confidence * 10 +
+            shoulderWidth
     }
 
     private var orientationSweepOptions: [(name: String, orientation: CGImagePropertyOrientation)] {
@@ -711,6 +889,9 @@ final class PostureAnalyzer {
                         shoulderWidth: nil,
                         neckDistance: nil,
                         candidateConfidence: nil,
+                        bodyBox: nil,
+                        headToFaceDelta: nil,
+                        shoulderMidToFaceDelta: nil,
                         joints: [:]
                     )
                 )
@@ -907,6 +1088,8 @@ final class PostureAnalyzer {
         unreliableSince = nil
         lastReliableMetrics = nil
         lastReliablePose = nil
+        consecutiveFailureFrameCount = 0
+        forcedVisionAttemptsSinceFailure = 0
         // A new baseline/run should collect fresh live failure evidence instead
         // of keeping an old sweep-limit count.
         trackingOrientationSweepCount = 0

@@ -31,10 +31,6 @@ final class Nudger: NSObject, UNUserNotificationCenterDelegate {
         notificationCenter.delegate = self
     }
 
-    func requestAuthorization() {
-        notificationCenter.requestAuthorization(options: [.alert, .sound]) { _, _ in }
-    }
-
     func update(
         status: PostureStatus,
         notificationsEnabled: Bool,
@@ -96,8 +92,10 @@ final class Nudger: NSObject, UNUserNotificationCenterDelegate {
         if isNewSlouch {
             if notificationsEnabled {
                 sendSlouchNotification()
+                lastNotificationDate = now
+            } else {
+                lastNotificationDate = nil
             }
-            lastNotificationDate = now
 
             if soundEnabled {
                 playSlouchSound()

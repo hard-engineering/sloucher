@@ -2,6 +2,16 @@ import AVFoundation
 import CoreVideo
 import Foundation
 
+struct FrameMotionGateDiagnostics: Equatable {
+    let shouldRunInference: Bool
+    let forceInference: Bool
+    let skipped: Bool
+    let meanAbsoluteDifference: Double?
+    let threshold: Double
+    let hadPreviousFrame: Bool
+    let frameHash: String?
+}
+
 final class FrameMotionGate {
     private static let thumbnailWidth = 32
     private static let thumbnailHeight = 24
@@ -18,20 +28,40 @@ final class FrameMotionGate {
         previousThumbnail = nil
     }
 
-    func shouldRunInference(sampleBuffer: CMSampleBuffer, forceInference: Bool) -> Bool {
+    func evaluate(sampleBuffer: CMSampleBuffer, forceInference: Bool) -> FrameMotionGateDiagnostics {
         guard let thumbnail = makeThumbnail(from: sampleBuffer) else {
-            return true
+            return FrameMotionGateDiagnostics(
+                shouldRunInference: true,
+                forceInference: forceInference,
+                skipped: false,
+                meanAbsoluteDifference: nil,
+                threshold: meanDifferenceThreshold,
+                hadPreviousFrame: previousThumbnail != nil,
+                frameHash: nil
+            )
         }
+
+        let priorThumbnail = previousThumbnail
+        let meanAbsoluteDifference = priorThumbnail.map {
+            self.meanAbsoluteDifference(thumbnail, $0)
+        }
+        let shouldRunInference = forceInference ||
+            priorThumbnail == nil ||
+            (meanAbsoluteDifference ?? .greatestFiniteMagnitude) >= meanDifferenceThreshold
 
         defer {
             previousThumbnail = thumbnail
         }
 
-        guard !forceInference, let previousThumbnail else {
-            return true
-        }
-
-        return meanAbsoluteDifference(thumbnail, previousThumbnail) >= meanDifferenceThreshold
+        return FrameMotionGateDiagnostics(
+            shouldRunInference: shouldRunInference,
+            forceInference: forceInference,
+            skipped: !shouldRunInference,
+            meanAbsoluteDifference: meanAbsoluteDifference,
+            threshold: meanDifferenceThreshold,
+            hadPreviousFrame: priorThumbnail != nil,
+            frameHash: thumbnailHash(thumbnail)
+        )
     }
 
     private func makeThumbnail(from sampleBuffer: CMSampleBuffer) -> [UInt8]? {
@@ -151,5 +181,15 @@ final class FrameMotionGate {
         }
 
         return Double(total) / Double(current.count)
+    }
+
+    private func thumbnailHash(_ thumbnail: [UInt8]) -> String {
+        var hash: UInt64 = 0xcbf29ce484222325
+        for byte in thumbnail {
+            hash ^= UInt64(byte)
+            hash &*= 0x100000001b3
+        }
+
+        return String(format: "%016llx", CUnsignedLongLong(hash))
     }
 }

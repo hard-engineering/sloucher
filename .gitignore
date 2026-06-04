@@ -2,6 +2,7 @@
 DerivedData/
 build/
 .build/
+dist/
 *.xcuserdata/
 xcuserdata/
 *.xcuserstate

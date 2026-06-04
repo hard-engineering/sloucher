@@ -4,7 +4,25 @@ import Combine
 import CoreImage
 import Foundation
 import ImageIO
+import UserNotifications
 import UniformTypeIdentifiers
+
+enum NotificationPermissionStatus: Equatable {
+    case notDetermined
+    case requesting
+    case provisional
+    case authorized
+    case denied
+
+    var canScheduleNotifications: Bool {
+        switch self {
+        case .provisional, .authorized:
+            true
+        case .notDetermined, .requesting, .denied:
+            false
+        }
+    }
+}
 
 final class AppState: ObservableObject {
     @Published var settings = SettingsStore()
@@ -28,6 +46,13 @@ final class AppState: ObservableObject {
     @Published private(set) var calibrationFrameCount = 0
     @Published private(set) var calibrationLastIssue: String?
     @Published private(set) var detailText: String?
+    @Published private(set) var cameraAuthorization: CameraAuthorization = .notDetermined
+    @Published private(set) var hasCheckedCameraAuthorization = false
+    @Published private(set) var notificationPermissionStatus: NotificationPermissionStatus = .notDetermined
+    @Published private(set) var isPermissionSetupVisible = false
+    var onInitialBlockingPermissionNeeded: (() -> Void)?
+    var onCameraPermissionRequestFinished: (() -> Void)?
+    var onCameraPermissionSatisfied: (() -> Void)?
     @Published var launchAtLoginEnabled: Bool = false {
         didSet {
             guard launchAtLoginEnabled != loginItemManager.isEnabled else { return }
@@ -52,6 +77,7 @@ final class AppState: ObservableObject {
     private var cancellables: Set<AnyCancellable> = []
     private var isManuallyPaused = false
     private var isPowerPaused = false
+    private var hasReliableTrackingSample = false
     private var powerPauseReason: String?
     private var snoozeUntil: Date?
     private var smoothedScore: Double?
@@ -69,6 +95,8 @@ final class AppState: ObservableObject {
     private var lastValidForensicFrame: ForensicFrameSnapshot?
     private var pendingForensicCollapse: ForensicFrameSnapshot?
     private var nextForensicCaptureAllowedAt = Date.distantPast
+    private var permissionPollingTimer: Timer?
+    private var cameraFrameWaitID: UUID?
 
     private struct RawPlaneDump {
         let name: String
@@ -89,11 +117,24 @@ final class AppState: ObservableObject {
     }
 
     var canCalibrate: Bool {
-        status != .cameraDenied && status != .cameraUnavailable && status != .calibrating
+        status != .cameraPermissionNeeded &&
+            status != .cameraDenied &&
+            status != .cameraStarting &&
+            status != .cameraNoFrames &&
+            status != .cameraUnavailable &&
+            status != .calibrating
     }
 
     var isPaused: Bool {
         isManuallyPaused
+    }
+
+    var notificationNudgesEnabled: Bool {
+        settings.notificationsEnabled && notificationPermissionStatus.canScheduleNotifications
+    }
+
+    var shouldShowPermissionSetup: Bool {
+        cameraAuthorization != .authorized
     }
 
     var displayBaselineDistance: Double? {
@@ -171,6 +212,12 @@ final class AppState: ObservableObject {
             lastFrameDiagnostics.faceDetected ? "Need shoulders" : "Need better view"
         case .uncalibrated:
             "Needs calibration"
+        case .cameraPermissionNeeded:
+            "Camera needed"
+        case .cameraStarting:
+            "Camera starting"
+        case .cameraNoFrames:
+            "Camera waiting"
         default:
             status.displayName
         }
@@ -189,6 +236,10 @@ final class AppState: ObservableObject {
 
         if !hasBaseline {
             return detailText ?? "Click Calibrate once your head and both shoulders are visible."
+        }
+
+        if status == .cameraPermissionNeeded || status == .cameraStarting || status == .cameraNoFrames {
+            return detailText
         }
 
         if status == .cannotSee {
@@ -214,7 +265,6 @@ final class AppState: ObservableObject {
         resetTrackingDebugDiagnostics()
         configureServices()
         configureSettingsObservation()
-        requestPermissionsAndStart()
     }
 
     func startCalibration() {
@@ -242,9 +292,9 @@ final class AppState: ObservableObject {
         nudger.clear()
 
         analysisQueue.sync {
-            // Recalibration must describe the user's current camera framing.
-            // Reusing recent samples can silently skip live collection and hide
-            // body-pose failures, so every calibration starts from empty samples.
+            // Calibration samples must start after the user clicks Calibrate.
+            // Do not seed from recent tracking frames; the user explicitly
+            // expects calibration to measure the current deliberate posture.
             calibrator.start(duration: 2, minimumSamples: requiredSamples)
             calibrationFrames = 0
             calibrationBodySuccesses = 0
@@ -267,45 +317,78 @@ final class AppState: ObservableObject {
         calibrationBodySamples = 0
 
         cameraController.forceNextFrame()
-        cameraController.start()
+        startCameraIfAllowed()
     }
 
     func togglePause() {
         if isManuallyPaused {
             isManuallyPaused = false
-            status = hasBaseline ? .good : .uncalibrated
-            detailText = nil
-            publishRuntimeDiagnostics(status: status, detail: detailText, metrics: latestMetrics)
+            guard cameraAuthorization == .authorized else {
+                refreshPermissionStatuses()
+                return
+            }
+            clearLiveCameraState()
+            status = .cameraStarting
+            detailText = "Starting camera."
+            publishRuntimeDiagnostics(status: status, detail: detailText, metrics: nil)
             if !isPowerPaused {
-                cameraController.start()
+                startCameraIfAllowed()
             }
         } else {
+            guard cameraAuthorization == .authorized else {
+                showPermissionSetupWindow()
+                return
+            }
             isManuallyPaused = true
             status = .paused
             detailText = "Monitoring is paused."
             publishRuntimeDiagnostics(status: status, detail: detailText, metrics: latestMetrics)
             nudger.clear()
-            cameraController.stop()
+            stopCamera()
         }
     }
 
     func snooze(minutes: Int) {
+        guard cameraAuthorization == .authorized else {
+            showPermissionSetupWindow()
+            return
+        }
         snoozeUntil = Date().addingTimeInterval(TimeInterval(minutes * 60))
         status = .snoozed
         detailText = "Monitoring resumes at \(snoozeUntil!.formatted(date: .omitted, time: .shortened))."
         publishRuntimeDiagnostics(status: status, detail: detailText, metrics: latestMetrics)
         nudger.clear()
-        cameraController.stop()
+        stopCamera()
     }
 
     func testNudge() {
-        detailText = "Testing notification, sound, and glow."
+        if settings.notificationsEnabled {
+            switch notificationPermissionStatus {
+            case .notDetermined:
+                requestProvisionalNotificationPermissionIfNeeded { [weak self] in
+                    self?.fireTestNudge()
+                }
+                return
+            case .denied:
+                detailText = "Notifications are off. Sound and screen glow still work."
+            case .requesting, .provisional, .authorized:
+                break
+            }
+        }
+
+        fireTestNudge()
+    }
+
+    private func fireTestNudge() {
+        if detailText?.hasPrefix("Notifications are off.") != true {
+            detailText = "Testing notification, sound, and glow."
+        }
         isNudgePreviewActive = true
         publishRuntimeDiagnostics(status: status, detail: detailText, metrics: latestMetrics)
 
         nudger.update(
             status: .slouching,
-            notificationsEnabled: settings.notificationsEnabled,
+            notificationsEnabled: notificationNudgesEnabled,
             soundEnabled: settings.soundEnabled,
             overlayEnabled: settings.overlayEnabled
         )
@@ -333,17 +416,20 @@ final class AppState: ObservableObject {
 
         if visible {
             guard
+                cameraAuthorization == .authorized,
                 !isManuallyPaused,
                 status != .snoozed,
+                status != .cameraPermissionNeeded,
                 status != .cameraDenied,
+                status != .cameraNoFrames,
                 status != .cameraUnavailable
             else {
                 return
             }
 
-            cameraController.start()
+            startCameraIfAllowed()
         } else if isPowerPaused && !isManuallyPaused && status != .snoozed {
-            cameraController.stop()
+            stopCamera()
             nudger.clear()
             status = .paused
             detailText = powerPauseReason
@@ -357,12 +443,37 @@ final class AppState: ObservableObject {
         }
 
         NSWorkspace.shared.open(url)
+        startPermissionPolling()
     }
 
     func quit() {
-        cameraController.stop()
+        stopCamera()
         nudger.clear()
         NSApp.terminate(nil)
+    }
+
+    private func startCameraIfAllowed(expectFrames: Bool = true) {
+        guard cameraAuthorization == .authorized else { return }
+        cameraController.start()
+        if expectFrames {
+            scheduleCameraFrameFallback()
+        }
+    }
+
+    private func stopCamera() {
+        cameraFrameWaitID = nil
+        cameraController.stop()
+    }
+
+    private func clearLiveCameraState() {
+        latestFrameImage = nil
+        latestPose = nil
+        latestMetrics = nil
+        postureScore = nil
+        hasReliableTrackingSample = false
+        metricHistory = []
+        smoothedScore = nil
+        lastScoreUpdateAt = nil
     }
 
     private func configureServices() {
@@ -378,12 +489,21 @@ final class AppState: ObservableObject {
         }
 
         cameraController.onFrame = { [weak self] sampleBuffer in
+            DispatchQueue.main.async {
+                self?.markCameraFrameReceived()
+            }
             self?.processFrame(sampleBuffer)
         }
 
         cameraController.onAuthorizationChange = { [weak self] authorization in
             DispatchQueue.main.async {
                 self?.applyCameraAuthorization(authorization)
+            }
+        }
+
+        cameraController.onAuthorizationRequestFinished = { [weak self] in
+            DispatchQueue.main.async {
+                self?.onCameraPermissionRequestFinished?()
             }
         }
 
@@ -414,9 +534,136 @@ final class AppState: ObservableObject {
             .store(in: &cancellables)
     }
 
-    private func requestPermissionsAndStart() {
-        nudger.requestAuthorization()
+    func refreshPermissionStatuses() {
+        refreshNotificationPermissionStatus()
+        cameraController.refreshAuthorizationAndConfigureIfAllowed()
+    }
+
+    func requestCameraPermission() {
         cameraController.requestAuthorizationAndConfigure()
+        startPermissionPolling()
+    }
+
+    func requestProvisionalNotificationPermissionIfNeeded(completion: (() -> Void)? = nil) {
+        guard settings.notificationsEnabled else {
+            completion?()
+            return
+        }
+
+        guard notificationPermissionStatus == .notDetermined else {
+            completion?()
+            return
+        }
+
+        notificationPermissionStatus = .requesting
+        startPermissionPolling()
+
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .provisional]) { [weak self] _, _ in
+            DispatchQueue.main.async {
+                self?.refreshNotificationPermissionStatus(completion: completion)
+            }
+        }
+    }
+
+    func requestNotificationPermissionIfNeeded() {
+        requestProvisionalNotificationPermissionIfNeeded()
+    }
+
+    func openNotificationSettings() {
+        guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.notifications") else {
+            return
+        }
+
+        NSWorkspace.shared.open(url)
+        startPermissionPolling()
+    }
+
+    func closePermissionSetup() {
+        isPermissionSetupVisible = false
+    }
+
+    private func refreshNotificationPermissionStatus(completion: (() -> Void)? = nil) {
+        UNUserNotificationCenter.current().getNotificationSettings { [weak self] settings in
+            let status: NotificationPermissionStatus
+            switch settings.authorizationStatus {
+            case .authorized, .ephemeral:
+                status = .authorized
+            case .provisional:
+                status = .provisional
+            case .denied:
+                status = .denied
+            case .notDetermined:
+                status = .notDetermined
+            @unknown default:
+                status = .denied
+            }
+
+            DispatchQueue.main.async {
+                guard let self else { return }
+                let nextStatus = self.notificationPermissionStatus == .requesting && status == .notDetermined
+                    ? .requesting
+                    : status
+                self.notificationPermissionStatus = nextStatus
+                completion?()
+            }
+        }
+    }
+
+    private func showPermissionSetupWindow() {
+        isPermissionSetupVisible = true
+    }
+
+    private func closePermissionSetupIfSatisfied() {
+        guard cameraAuthorization == .authorized else { return }
+        isPermissionSetupVisible = false
+        if notificationPermissionStatus != .requesting {
+            stopPermissionPolling()
+        }
+    }
+
+    private func startPermissionPolling() {
+        permissionPollingTimer?.invalidate()
+        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+            self?.refreshPermissionStatuses()
+        }
+        permissionPollingTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func stopPermissionPolling() {
+        permissionPollingTimer?.invalidate()
+        permissionPollingTimer = nil
+    }
+
+    private func scheduleCameraFrameFallback() {
+        let waitID = UUID()
+        cameraFrameWaitID = waitID
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+            guard
+                let self,
+                self.cameraFrameWaitID == waitID,
+                self.cameraAuthorization == .authorized,
+                !self.isManuallyPaused,
+                !self.isPowerPaused
+            else {
+                return
+            }
+
+            self.status = .cameraNoFrames
+            self.detailText = "Camera access is enabled, but no frames are arriving. Quit other camera apps or restart Sloucher."
+            self.clearLiveCameraState()
+            self.publishRuntimeDiagnostics(status: self.status, detail: self.detailText, metrics: nil)
+        }
+    }
+
+    private func markCameraFrameReceived() {
+        cameraFrameWaitID = nil
+        if status == .cameraNoFrames {
+            status = .cameraStarting
+            detailText = "Camera frame received. Measuring posture."
+            publishRuntimeDiagnostics(status: status, detail: detailText, metrics: nil)
+        }
     }
 
     private func processFrame(_ sampleBuffer: CMSampleBuffer) {
@@ -427,6 +674,7 @@ final class AppState: ObservableObject {
             let forceInference = isCalibrating || self.inspectorVisible
             let frameImage = self.makeFrameImage(from: sampleBuffer)
             let pixelBufferDiagnostics = Self.pixelBufferDiagnostics(from: sampleBuffer)
+            let frameIdentityDiagnostics = Self.frameIdentityDiagnostics(from: sampleBuffer)
             let result = self.postureAnalyzer.analyze(
                 sampleBuffer: sampleBuffer,
                 config: self.settings.decisionConfig,
@@ -437,8 +685,19 @@ final class AppState: ObservableObject {
             let frameDiagnostics = self.postureAnalyzer.lastFrameDiagnostics
             self.publishFrameDiagnostics(frameDiagnostics, result: result)
             self.publishPixelBufferDiagnostics(pixelBufferDiagnostics)
+            self.publishFrameIdentityDiagnostics(frameIdentityDiagnostics)
             if collectTrackingDiagnostics, let pixelBufferDiagnostics {
-                let trackingFrame = self.recordTrackingDiagnostics(frameDiagnostics, result: result)
+                let trackingFrame = self.recordTrackingDiagnostics(
+                    frameDiagnostics,
+                    result: result,
+                    pixelBufferDiagnostics: pixelBufferDiagnostics,
+                    frameIdentityDiagnostics: frameIdentityDiagnostics
+                )
+
+                #if DEBUG
+                // Forensic capture can store camera pixels on disk. Keep that
+                // evidence path in debug builds only so shipped builds retain
+                // numeric diagnostics without writing frame images/raw planes.
                 self.updateForensicCapture(
                     trackingFrame: trackingFrame,
                     pixelBufferDiagnostics: pixelBufferDiagnostics,
@@ -447,6 +706,7 @@ final class AppState: ObservableObject {
                     sampleBuffer: sampleBuffer,
                     frameImage: frameImage
                 )
+                #endif
             }
 
             if let metrics = result.metrics, metrics.source == .body {
@@ -668,12 +928,29 @@ final class AppState: ObservableObject {
                 return
             }
             self.snoozeUntil = nil
-            cameraController.start()
+            startCameraIfAllowed()
         }
 
-        let nextStatus = hasBaseline ? result.status : .uncalibrated
+        let wasWaitingForFirstFrame = status == .cameraStarting || status == .cameraNoFrames
+        let hasCurrentMetrics = result.metrics != nil
+        // The analyzer carries a previous posture state through unreliable
+        // frames. On startup there is no previous reliable sample, so do not
+        // let that fallback appear as "Good posture" before metrics exist.
+        let nextStatus: PostureStatus
+        if hasBaseline {
+            if hasCurrentMetrics || hasReliableTrackingSample {
+                nextStatus = result.status
+            } else if result.reason != nil {
+                nextStatus = .cannotSee
+            } else {
+                nextStatus = .cameraStarting
+            }
+        } else {
+            nextStatus = .uncalibrated
+        }
         if let metrics = result.metrics {
             latestMetrics = metrics
+            hasReliableTrackingSample = true
         } else if nextStatus == .cannotSee {
             latestMetrics = nil
         }
@@ -710,33 +987,74 @@ final class AppState: ObservableObject {
         }
 
         publishRuntimeDiagnostics(status: nextStatus, detail: detailText, metrics: liveMetrics)
+        if wasWaitingForFirstFrame {
+            showCalibrationHintIfNeeded()
+        }
+
+        if nextStatus == .slouching {
+            requestProvisionalNotificationPermissionIfNeeded()
+        }
 
         nudger.update(
             status: nextStatus,
-            notificationsEnabled: settings.notificationsEnabled,
+            notificationsEnabled: notificationNudgesEnabled,
             soundEnabled: settings.soundEnabled,
             overlayEnabled: settings.overlayEnabled
         )
     }
 
     private func applyCameraAuthorization(_ authorization: CameraAuthorization) {
+        let previousAuthorization = cameraAuthorization
+        let isInitialPermissionCheck = !hasCheckedCameraAuthorization
+        cameraAuthorization = authorization
+        hasCheckedCameraAuthorization = true
+
         switch authorization {
+        case .notDetermined:
+            stopCamera()
+            status = .cameraPermissionNeeded
+            detailText = "Camera access is required to measure posture."
+            postureScore = nil
+            publishRuntimeDiagnostics(status: status, detail: detailText, metrics: nil)
+            showPermissionSetupWindow()
+        case .requesting:
+            stopCamera()
+            status = .cameraPermissionNeeded
+            detailText = "Waiting for camera permission."
+            postureScore = nil
+            publishRuntimeDiagnostics(status: status, detail: detailText, metrics: nil)
         case .authorized:
-            status = hasBaseline ? .good : .uncalibrated
-            detailText = hasBaseline ? nil : "Calibrate once while sitting upright."
-            publishRuntimeDiagnostics(status: status, detail: detailText, metrics: latestMetrics)
-            showCalibrationHintIfNeeded()
-            cameraController.start()
+            closePermissionSetupIfSatisfied()
+            // Settings polling can report authorized repeatedly; do not reset a
+            // live session back to startup unless we are recovering from no frames.
+            guard previousAuthorization != .authorized || status == .cameraNoFrames else {
+                return
+            }
+            clearLiveCameraState()
+            status = .cameraStarting
+            detailText = "Starting camera."
+            publishRuntimeDiagnostics(status: status, detail: detailText, metrics: nil)
+            startCameraIfAllowed()
+            requestProvisionalNotificationPermissionIfNeeded()
+            onCameraPermissionSatisfied?()
         case .denied:
+            stopCamera()
             status = .cameraDenied
             detailText = "Allow camera access in System Settings."
             postureScore = nil
-            publishRuntimeDiagnostics(status: status, detail: detailText, metrics: latestMetrics)
+            publishRuntimeDiagnostics(status: status, detail: detailText, metrics: nil)
+            showPermissionSetupWindow()
         case .unavailable:
+            stopCamera()
             status = .cameraUnavailable
             detailText = "No video camera was found."
             postureScore = nil
-            publishRuntimeDiagnostics(status: status, detail: detailText, metrics: latestMetrics)
+            publishRuntimeDiagnostics(status: status, detail: detailText, metrics: nil)
+            showPermissionSetupWindow()
+        }
+
+        if isInitialPermissionCheck && authorization != .authorized {
+            onInitialBlockingPermissionNeeded?()
         }
     }
 
@@ -745,14 +1063,16 @@ final class AppState: ObservableObject {
         powerPauseReason = reason
 
         if shouldCapture {
+            guard cameraAuthorization == .authorized else { return }
             guard !isManuallyPaused && status != .snoozed else { return }
-            cameraController.start()
-            status = hasBaseline ? .good : .uncalibrated
-            detailText = nil
-            publishRuntimeDiagnostics(status: status, detail: detailText, metrics: latestMetrics)
+            clearLiveCameraState()
+            startCameraIfAllowed()
+            status = .cameraStarting
+            detailText = "Starting camera."
+            publishRuntimeDiagnostics(status: status, detail: detailText, metrics: nil)
         } else {
             guard !inspectorVisible else { return }
-            cameraController.stop()
+            stopCamera()
             nudger.clear()
             if !isManuallyPaused && status != .snoozed {
                 status = .paused
@@ -989,7 +1309,9 @@ final class AppState: ObservableObject {
 
     private func recordTrackingDiagnostics(
         _ diagnostics: PostureFrameDiagnostics,
-        result: PostureAnalysisResult
+        result: PostureAnalysisResult,
+        pixelBufferDiagnostics: PosturePixelBufferDiagnostics,
+        frameIdentityDiagnostics: PostureFrameIdentityDiagnostics?
     ) -> PostureTrackingFrameDiagnostics {
         trackingDebugFrameNumber += 1
 
@@ -998,12 +1320,19 @@ final class AppState: ObservableObject {
         let frame = PostureTrackingFrameDiagnostics(
             frame: trackingDebugFrameNumber,
             timestamp: Date(),
+            presentationTimeSeconds: pixelBufferDiagnostics.presentationTimeSeconds,
+            lumaSampleHash: frameIdentityDiagnostics?.lumaSampleHash,
+            lumaSampleChecksum: frameIdentityDiagnostics?.lumaSampleChecksum,
             status: result.status.rawValue,
             acceptedFrame: result.acceptedFrame,
             reason: result.reason,
             bodyObservationCount: diagnostics.bodyObservationCount,
             validBodyCandidateCount: diagnostics.validBodyCandidateCount,
+            bodyObservations: diagnostics.bodyObservations,
             faceDetected: diagnostics.faceDetected,
+            faceObservationCount: diagnostics.faceObservationCount,
+            faceBox: diagnostics.faceBox,
+            faceConfidence: diagnostics.faceConfidence,
             candidateConfidence: diagnostics.candidateConfidence,
             candidateShoulderWidth: diagnostics.candidateShoulderWidth,
             candidateNeckDistance: diagnostics.candidateNeckDistance,
@@ -1014,7 +1343,20 @@ final class AppState: ObservableObject {
             rawRejectReason: diagnostics.rawRejectReason,
             metricShoulderWidth: result.metrics?.shoulderWidth,
             metricNeckDistance: result.metrics?.neckDistance,
-            metricCloseness: result.metrics?.closeness
+            metricCloseness: result.metrics?.closeness,
+            forceInference: diagnostics.forceInference,
+            motionGateSkipped: diagnostics.motionGateSkipped,
+            motionGateMeanAbsoluteDifference: diagnostics.motionGateMeanAbsoluteDifference,
+            motionGateThreshold: diagnostics.motionGateThreshold,
+            motionGateHadPreviousFrame: diagnostics.motionGateHadPreviousFrame,
+            motionGateFrameHash: diagnostics.motionGateFrameHash,
+            consecutiveFailureFrameCount: diagnostics.consecutiveFailureFrameCount,
+            forcedVisionAttemptsSinceFailure: diagnostics.forcedVisionAttemptsSinceFailure,
+            orientationRetryBestOrientation: diagnostics.orientationRetryBestOrientation,
+            orientationRetryBestValidCandidateCount: diagnostics.orientationRetryBestValidCandidateCount,
+            orientationRetryUpMirroredValidCandidateCount: diagnostics.orientationRetryUpMirroredValidCandidateCount,
+            orientationRetryUpMirroredShoulderWidth: diagnostics.orientationRetryUpMirroredShoulderWidth,
+            orientationRetryUpMirroredRejectReason: diagnostics.orientationRetryUpMirroredRejectReason
         )
 
         trackingDebugFrames.append(frame)
@@ -1053,6 +1395,13 @@ final class AppState: ObservableObject {
         runtimeDefaults.set(summary.validCandidateFrameCount, forKey: RuntimeKeys.trackingDebugValidCandidateFrames)
         runtimeDefaults.set(summary.noBodyObservationFrameCount, forKey: RuntimeKeys.trackingDebugNoBodyObservationFrames)
         runtimeDefaults.set(summary.invalidBodyCandidateFrameCount, forKey: RuntimeKeys.trackingDebugInvalidCandidateFrames)
+        runtimeDefaults.set(summary.motionSkippedFrameCount, forKey: RuntimeKeys.trackingDebugMotionSkippedFrames)
+        runtimeDefaults.set(summary.forcedInferenceFrameCount, forKey: RuntimeKeys.trackingDebugForcedInferenceFrames)
+        runtimeDefaults.set(summary.uniqueLumaHashCount, forKey: RuntimeKeys.trackingDebugUniqueLumaHashes)
+        setRuntime(
+            summary.latestPresentationTimeSeconds,
+            forKey: RuntimeKeys.trackingDebugLatestPresentationTimeSeconds
+        )
         setRuntime(summary.latestStatus, forKey: RuntimeKeys.trackingDebugLatestStatus)
         setRuntime(summary.latestRejectReason, forKey: RuntimeKeys.trackingDebugLatestRejectReason)
         setRuntime(summary.rawShoulderWidthMin, forKey: RuntimeKeys.trackingDebugRawShoulderWidthMin)
@@ -1096,6 +1445,10 @@ final class AppState: ObservableObject {
         runtimeDefaults.removeObject(forKey: RuntimeKeys.trackingDebugValidCandidateFrames)
         runtimeDefaults.removeObject(forKey: RuntimeKeys.trackingDebugNoBodyObservationFrames)
         runtimeDefaults.removeObject(forKey: RuntimeKeys.trackingDebugInvalidCandidateFrames)
+        runtimeDefaults.removeObject(forKey: RuntimeKeys.trackingDebugMotionSkippedFrames)
+        runtimeDefaults.removeObject(forKey: RuntimeKeys.trackingDebugForcedInferenceFrames)
+        runtimeDefaults.removeObject(forKey: RuntimeKeys.trackingDebugUniqueLumaHashes)
+        runtimeDefaults.removeObject(forKey: RuntimeKeys.trackingDebugLatestPresentationTimeSeconds)
         runtimeDefaults.removeObject(forKey: RuntimeKeys.trackingDebugLatestStatus)
         runtimeDefaults.removeObject(forKey: RuntimeKeys.trackingDebugLatestRejectReason)
         runtimeDefaults.removeObject(forKey: RuntimeKeys.trackingDebugRawShoulderWidthMin)
@@ -1283,6 +1636,12 @@ final class AppState: ObservableObject {
         runtimeDefaults.set(diagnostics.bodyObservationCount, forKey: RuntimeKeys.frameBodyObservationCount)
         runtimeDefaults.set(diagnostics.validBodyCandidateCount, forKey: RuntimeKeys.frameValidBodyCandidateCount)
         runtimeDefaults.set(diagnostics.faceDetected, forKey: RuntimeKeys.frameFaceDetected)
+        runtimeDefaults.set(diagnostics.faceObservationCount, forKey: RuntimeKeys.frameFaceObservationCount)
+        setRuntime(diagnostics.faceBox?.minX, forKey: RuntimeKeys.frameFaceBoxMinX)
+        setRuntime(diagnostics.faceBox?.minY, forKey: RuntimeKeys.frameFaceBoxMinY)
+        setRuntime(diagnostics.faceBox?.maxX, forKey: RuntimeKeys.frameFaceBoxMaxX)
+        setRuntime(diagnostics.faceBox?.maxY, forKey: RuntimeKeys.frameFaceBoxMaxY)
+        setRuntime(diagnostics.faceConfidence, forKey: RuntimeKeys.frameFaceConfidence)
         setRuntime(diagnostics.bodyFailureReason, forKey: RuntimeKeys.frameBodyFailure)
         setRuntime(diagnostics.headAnchorSource, forKey: RuntimeKeys.frameHeadAnchorSource)
         setRuntime(diagnostics.candidateConfidence, forKey: RuntimeKeys.frameCandidateConfidence)
@@ -1296,6 +1655,34 @@ final class AppState: ObservableObject {
         setRuntime(diagnostics.rawRightShoulderConfidence, forKey: RuntimeKeys.frameRawRightShoulderConfidence)
         setRuntime(diagnostics.rawShoulderWidth, forKey: RuntimeKeys.frameRawShoulderWidth)
         setRuntime(diagnostics.rawRejectReason, forKey: RuntimeKeys.frameRawRejectReason)
+        runtimeDefaults.set(diagnostics.forceInference, forKey: RuntimeKeys.frameForceInference)
+        runtimeDefaults.set(diagnostics.motionGateSkipped, forKey: RuntimeKeys.frameMotionGateSkipped)
+        setRuntime(diagnostics.motionGateMeanAbsoluteDifference, forKey: RuntimeKeys.frameMotionGateMAD)
+        setRuntime(diagnostics.motionGateThreshold, forKey: RuntimeKeys.frameMotionGateThreshold)
+        runtimeDefaults.set(diagnostics.motionGateHadPreviousFrame, forKey: RuntimeKeys.frameMotionGateHadPreviousFrame)
+        setRuntime(diagnostics.motionGateFrameHash, forKey: RuntimeKeys.frameMotionGateFrameHash)
+        runtimeDefaults.set(diagnostics.consecutiveFailureFrameCount, forKey: RuntimeKeys.frameConsecutiveFailureFrameCount)
+        runtimeDefaults.set(
+            diagnostics.forcedVisionAttemptsSinceFailure,
+            forKey: RuntimeKeys.frameForcedVisionAttemptsSinceFailure
+        )
+        setRuntime(diagnostics.orientationRetryBestOrientation, forKey: RuntimeKeys.frameOrientationRetryBestOrientation)
+        setRuntime(
+            diagnostics.orientationRetryBestValidCandidateCount,
+            forKey: RuntimeKeys.frameOrientationRetryBestValidCandidateCount
+        )
+        setRuntime(
+            diagnostics.orientationRetryUpMirroredValidCandidateCount,
+            forKey: RuntimeKeys.frameOrientationRetryUpMirroredValidCandidateCount
+        )
+        setRuntime(
+            diagnostics.orientationRetryUpMirroredShoulderWidth,
+            forKey: RuntimeKeys.frameOrientationRetryUpMirroredShoulderWidth
+        )
+        setRuntime(
+            diagnostics.orientationRetryUpMirroredRejectReason,
+            forKey: RuntimeKeys.frameOrientationRetryUpMirroredRejectReason
+        )
     }
 
     private func publishPixelBufferDiagnostics(_ diagnostics: PosturePixelBufferDiagnostics?) {
@@ -1306,6 +1693,7 @@ final class AppState: ObservableObject {
             runtimeDefaults.removeObject(forKey: RuntimeKeys.framePixelHeight)
             runtimeDefaults.removeObject(forKey: RuntimeKeys.framePixelIsPlanar)
             runtimeDefaults.removeObject(forKey: RuntimeKeys.framePixelPlaneCount)
+            runtimeDefaults.removeObject(forKey: RuntimeKeys.framePixelPresentationTimeSeconds)
             return
         }
 
@@ -1315,6 +1703,22 @@ final class AppState: ObservableObject {
         runtimeDefaults.set(diagnostics.height, forKey: RuntimeKeys.framePixelHeight)
         runtimeDefaults.set(diagnostics.isPlanar, forKey: RuntimeKeys.framePixelIsPlanar)
         runtimeDefaults.set(diagnostics.planeCount, forKey: RuntimeKeys.framePixelPlaneCount)
+        setRuntime(diagnostics.presentationTimeSeconds, forKey: RuntimeKeys.framePixelPresentationTimeSeconds)
+    }
+
+    private func publishFrameIdentityDiagnostics(_ diagnostics: PostureFrameIdentityDiagnostics?) {
+        guard let diagnostics else {
+            runtimeDefaults.removeObject(forKey: RuntimeKeys.frameLumaSampleHash)
+            runtimeDefaults.removeObject(forKey: RuntimeKeys.frameLumaSampleChecksum)
+            runtimeDefaults.removeObject(forKey: RuntimeKeys.frameLumaSampleWidth)
+            runtimeDefaults.removeObject(forKey: RuntimeKeys.frameLumaSampleHeight)
+            return
+        }
+
+        runtimeDefaults.set(diagnostics.lumaSampleHash, forKey: RuntimeKeys.frameLumaSampleHash)
+        runtimeDefaults.set(diagnostics.lumaSampleChecksum, forKey: RuntimeKeys.frameLumaSampleChecksum)
+        runtimeDefaults.set(diagnostics.lumaSampleWidth, forKey: RuntimeKeys.frameLumaSampleWidth)
+        runtimeDefaults.set(diagnostics.lumaSampleHeight, forKey: RuntimeKeys.frameLumaSampleHeight)
     }
 
     private func setRuntime(_ value: Any?, forKey key: String) {
@@ -1401,6 +1805,149 @@ final class AppState: ObservableObject {
         )
     }
 
+    private static func frameIdentityDiagnostics(from sampleBuffer: CMSampleBuffer) -> PostureFrameIdentityDiagnostics? {
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return nil }
+
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+
+        let sampleWidth = 64
+        let sampleHeight = 36
+        let samples: [UInt8]?
+
+        if CVPixelBufferGetPlaneCount(pixelBuffer) > 0 {
+            samples = sampledPlanarLuma(
+                from: pixelBuffer,
+                sampleWidth: sampleWidth,
+                sampleHeight: sampleHeight
+            )
+        } else {
+            samples = sampledPackedLuma(
+                from: pixelBuffer,
+                sampleWidth: sampleWidth,
+                sampleHeight: sampleHeight
+            )
+        }
+
+        guard let samples, !samples.isEmpty else { return nil }
+
+        return PostureFrameIdentityDiagnostics(
+            lumaSampleHash: lumaHash(samples),
+            lumaSampleChecksum: samples.reduce(0) { $0 + Int($1) },
+            lumaSampleWidth: sampleWidth,
+            lumaSampleHeight: sampleHeight
+        )
+    }
+
+    private static func sampledPlanarLuma(
+        from pixelBuffer: CVPixelBuffer,
+        sampleWidth: Int,
+        sampleHeight: Int
+    ) -> [UInt8]? {
+        guard let baseAddress = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0) else {
+            return nil
+        }
+
+        let width = CVPixelBufferGetWidthOfPlane(pixelBuffer, 0)
+        let height = CVPixelBufferGetHeightOfPlane(pixelBuffer, 0)
+        let bytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0)
+        guard width > 0, height > 0, bytesPerRow > 0 else {
+            return nil
+        }
+
+        let base = baseAddress.assumingMemoryBound(to: UInt8.self)
+        var samples: [UInt8] = []
+        samples.reserveCapacity(sampleWidth * sampleHeight)
+
+        for sampleY in 0..<sampleHeight {
+            let sourceY = min(height - 1, sampleY * height / sampleHeight)
+            let row = base.advanced(by: sourceY * bytesPerRow)
+
+            for sampleX in 0..<sampleWidth {
+                let sourceX = min(width - 1, sampleX * width / sampleWidth)
+                samples.append(row[sourceX])
+            }
+        }
+
+        return samples
+    }
+
+    private static func sampledPackedLuma(
+        from pixelBuffer: CVPixelBuffer,
+        sampleWidth: Int,
+        sampleHeight: Int
+    ) -> [UInt8]? {
+        guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else {
+            return nil
+        }
+
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        let pixelFormat = CVPixelBufferGetPixelFormatType(pixelBuffer)
+        guard width > 0, height > 0, bytesPerRow > 0 else {
+            return nil
+        }
+
+        switch pixelFormat {
+        case kCVPixelFormatType_32BGRA, kCVPixelFormatType_32ARGB, kCVPixelFormatType_32RGBA:
+            break
+        default:
+            return nil
+        }
+
+        let base = baseAddress.assumingMemoryBound(to: UInt8.self)
+        var samples: [UInt8] = []
+        samples.reserveCapacity(sampleWidth * sampleHeight)
+
+        for sampleY in 0..<sampleHeight {
+            let sourceY = min(height - 1, sampleY * height / sampleHeight)
+            let row = base.advanced(by: sourceY * bytesPerRow)
+
+            for sampleX in 0..<sampleWidth {
+                let sourceX = min(width - 1, sampleX * width / sampleWidth)
+                let pixel = row.advanced(by: sourceX * 4)
+                samples.append(luma(fromPackedPixel: pixel, pixelFormat: pixelFormat))
+            }
+        }
+
+        return samples
+    }
+
+    private static func luma(fromPackedPixel pixel: UnsafePointer<UInt8>, pixelFormat: OSType) -> UInt8 {
+        let red: UInt8
+        let green: UInt8
+        let blue: UInt8
+
+        switch pixelFormat {
+        case kCVPixelFormatType_32ARGB:
+            red = pixel[1]
+            green = pixel[2]
+            blue = pixel[3]
+        case kCVPixelFormatType_32RGBA:
+            red = pixel[0]
+            green = pixel[1]
+            blue = pixel[2]
+        default:
+            blue = pixel[0]
+            green = pixel[1]
+            red = pixel[2]
+        }
+
+        let weighted = UInt16(red) * 77 + UInt16(green) * 150 + UInt16(blue) * 29
+        return UInt8(weighted >> 8)
+    }
+
+    private static func lumaHash(_ samples: [UInt8]) -> String {
+        var hash: UInt64 = 0xcbf29ce484222325
+        for sample in samples {
+            hash ^= UInt64(sample)
+            hash &*= 0x100000001b3
+        }
+
+        return String(format: "%016llx", CUnsignedLongLong(hash))
+    }
+
     private static func rawPlaneDumps(from sampleBuffer: CMSampleBuffer) -> [RawPlaneDump] {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return [] }
 
@@ -1482,6 +2029,10 @@ final class AppState: ObservableObject {
                     $0.bodyObservationCount > 0 &&
                     $0.validBodyCandidateCount == 0
             }.count,
+            motionSkippedFrameCount: frames.filter(\.motionGateSkipped).count,
+            forcedInferenceFrameCount: frames.filter(\.forceInference).count,
+            uniqueLumaHashCount: Set(frames.compactMap(\.lumaSampleHash)).count,
+            latestPresentationTimeSeconds: frames.last?.presentationTimeSeconds,
             latestStatus: frames.last?.status,
             latestRejectReason: frames.last.flatMap {
                 $0.acceptedFrame ? nil : ($0.rawRejectReason ?? $0.reason)
@@ -1577,6 +2128,12 @@ final class AppState: ObservableObject {
         static let frameBodyObservationCount = "runtime.frame.bodyObservationCount"
         static let frameValidBodyCandidateCount = "runtime.frame.validBodyCandidateCount"
         static let frameFaceDetected = "runtime.frame.faceDetected"
+        static let frameFaceObservationCount = "runtime.frame.faceObservationCount"
+        static let frameFaceBoxMinX = "runtime.frame.face.bbox.minX"
+        static let frameFaceBoxMinY = "runtime.frame.face.bbox.minY"
+        static let frameFaceBoxMaxX = "runtime.frame.face.bbox.maxX"
+        static let frameFaceBoxMaxY = "runtime.frame.face.bbox.maxY"
+        static let frameFaceConfidence = "runtime.frame.face.confidence"
         static let frameBodyFailure = "runtime.frame.bodyFailure"
         static let frameHeadAnchorSource = "runtime.frame.headAnchorSource"
         static let frameCandidateConfidence = "runtime.frame.candidate.confidence"
@@ -1590,12 +2147,33 @@ final class AppState: ObservableObject {
         static let frameRawRightShoulderConfidence = "runtime.frame.raw.rightShoulder.confidence"
         static let frameRawShoulderWidth = "runtime.frame.raw.shoulderWidth"
         static let frameRawRejectReason = "runtime.frame.raw.rejectReason"
+        static let frameForceInference = "runtime.frame.forceInference"
+        static let frameMotionGateSkipped = "runtime.frame.motionGate.skipped"
+        static let frameMotionGateMAD = "runtime.frame.motionGate.thumbnailMAD"
+        static let frameMotionGateThreshold = "runtime.frame.motionGate.threshold"
+        static let frameMotionGateHadPreviousFrame = "runtime.frame.motionGate.hadPreviousFrame"
+        static let frameMotionGateFrameHash = "runtime.frame.motionGate.frameHash"
+        static let frameConsecutiveFailureFrameCount = "runtime.frame.failureRun.consecutiveFrames"
+        static let frameForcedVisionAttemptsSinceFailure = "runtime.frame.failureRun.forcedVisionAttempts"
+        static let frameOrientationRetryBestOrientation = "runtime.frame.orientationRetry.bestOrientation"
+        static let frameOrientationRetryBestValidCandidateCount = "runtime.frame.orientationRetry.bestValidCandidateCount"
+        static let frameOrientationRetryUpMirroredValidCandidateCount =
+            "runtime.frame.orientationRetry.upMirrored.validCandidateCount"
+        static let frameOrientationRetryUpMirroredShoulderWidth =
+            "runtime.frame.orientationRetry.upMirrored.shoulderWidth"
+        static let frameOrientationRetryUpMirroredRejectReason =
+            "runtime.frame.orientationRetry.upMirrored.rejectReason"
         static let framePixelFormat = "runtime.frame.pixel.format"
         static let framePixelFormatCode = "runtime.frame.pixel.formatCode"
         static let framePixelWidth = "runtime.frame.pixel.width"
         static let framePixelHeight = "runtime.frame.pixel.height"
         static let framePixelIsPlanar = "runtime.frame.pixel.isPlanar"
         static let framePixelPlaneCount = "runtime.frame.pixel.planeCount"
+        static let framePixelPresentationTimeSeconds = "runtime.frame.pixel.presentationTimeSeconds"
+        static let frameLumaSampleHash = "runtime.frame.lumaSample.hash"
+        static let frameLumaSampleChecksum = "runtime.frame.lumaSample.checksum"
+        static let frameLumaSampleWidth = "runtime.frame.lumaSample.width"
+        static let frameLumaSampleHeight = "runtime.frame.lumaSample.height"
         static let trackingDebugFrames = "runtime.tracking.debug.frames"
         static let trackingDebugSummary = "runtime.tracking.debug.summary"
         static let trackingDebugOrientationSweeps = "runtime.tracking.debug.orientationSweeps"
@@ -1607,6 +2185,11 @@ final class AppState: ObservableObject {
         static let trackingDebugValidCandidateFrames = "runtime.tracking.debug.window.validCandidateFrames"
         static let trackingDebugNoBodyObservationFrames = "runtime.tracking.debug.window.noBodyObservationFrames"
         static let trackingDebugInvalidCandidateFrames = "runtime.tracking.debug.window.invalidCandidateFrames"
+        static let trackingDebugMotionSkippedFrames = "runtime.tracking.debug.window.motionSkippedFrames"
+        static let trackingDebugForcedInferenceFrames = "runtime.tracking.debug.window.forcedInferenceFrames"
+        static let trackingDebugUniqueLumaHashes = "runtime.tracking.debug.window.uniqueLumaHashes"
+        static let trackingDebugLatestPresentationTimeSeconds =
+            "runtime.tracking.debug.latestPresentationTimeSeconds"
         static let trackingDebugLatestStatus = "runtime.tracking.debug.latestStatus"
         static let trackingDebugLatestRejectReason = "runtime.tracking.debug.latestRejectReason"
         static let trackingDebugRawShoulderWidthMin = "runtime.tracking.debug.rawShoulderWidth.min"
