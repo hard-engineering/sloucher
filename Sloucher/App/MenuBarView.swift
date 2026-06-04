@@ -1,6 +1,14 @@
 import AppKit
 import SwiftUI
 
+private enum AppIconProvider {
+    static func image() -> NSImage {
+        Bundle.main
+            .url(forResource: "AppIcon", withExtension: "icns")
+            .flatMap(NSImage.init(contentsOf:)) ?? NSApp.applicationIconImage
+    }
+}
+
 struct MainWindowRootView: View {
     @EnvironmentObject private var appState: AppState
 
@@ -43,6 +51,10 @@ struct MenuBarView: View {
                 .frame(height: 86)
 
             InspectorControls()
+
+            if appState.shouldShowNotificationSetupPanel {
+                NotificationSetupPanel()
+            }
 
             UtilityControls()
         }
@@ -111,20 +123,178 @@ private struct InspectorGuidance: View {
     }
 }
 
+private struct NotificationSetupPanel: View {
+    @EnvironmentObject private var appState: AppState
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 10) {
+            ZStack {
+                Circle()
+                    .fill(iconColor.opacity(0.14))
+
+                Image(systemName: iconName)
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundStyle(iconColor)
+            }
+            .frame(width: 38, height: 38)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.system(size: 13, weight: .semibold))
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Text(message)
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Spacer(minLength: 8)
+
+            actions
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 9)
+        .background(iconColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(iconColor.opacity(0.16), lineWidth: 1)
+        )
+        .help(helpText)
+    }
+
+    @ViewBuilder
+    private var actions: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 8) {
+                primaryAction
+                secondaryAction
+            }
+
+            VStack(alignment: .trailing, spacing: 6) {
+                primaryAction
+                secondaryAction
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var primaryAction: some View {
+        switch appState.notificationPermissionStatus {
+        case .notDetermined, .provisional:
+            Button {
+                appState.requestNotificationPermissionIfNeeded()
+            } label: {
+                Label("Enable Notifications", systemImage: "bell.fill")
+                    .fixedSize(horizontal: true, vertical: false)
+            }
+            .help("Enable notification banners and sound")
+        case .requesting:
+            HStack(spacing: 6) {
+                ProgressView()
+                    .controlSize(.small)
+                Text("Waiting...")
+                    .font(.system(size: 12, weight: .medium))
+                    .fixedSize(horizontal: true, vertical: false)
+            }
+        case .denied:
+            Button {
+                appState.openNotificationSettings()
+            } label: {
+                Label("Settings", systemImage: "gearshape")
+                    .fixedSize(horizontal: true, vertical: false)
+            }
+            .help("Open Notification settings")
+        case .authorized:
+            Button {
+                appState.testNudge()
+            } label: {
+                Label("Test nudge", systemImage: "bell.fill")
+                    .fixedSize(horizontal: true, vertical: false)
+            }
+            .help("Test notification, sound, and screen glow")
+        }
+    }
+
+    private var secondaryAction: some View {
+        Button(appState.notificationPermissionStatus == .authorized ? "Done" : "Not Now") {
+            appState.dismissNotificationSetupForSession()
+        }
+        .controlSize(.small)
+        .fixedSize(horizontal: true, vertical: false)
+        .help(appState.notificationPermissionStatus == .authorized ? "Dismiss" : "Skip for now")
+    }
+
+    private var title: String {
+        switch appState.notificationPermissionStatus {
+        case .notDetermined:
+            "Enable posture nudges"
+        case .requesting:
+            "Waiting for notification permission"
+        case .provisional:
+            "Enable notification banners"
+        case .authorized:
+            "Notifications enabled"
+        case .denied:
+            "Notifications are off"
+        }
+    }
+
+    private var message: String {
+        switch appState.notificationPermissionStatus {
+        case .notDetermined:
+            "Sloucher can show a banner and sound when posture drops."
+        case .requesting:
+            "Respond to the macOS permission prompt."
+        case .provisional:
+            "Sloucher is currently quiet in Notification Centre."
+        case .authorized:
+            "Run one test to confirm the full nudge path."
+        case .denied:
+            "Sound and screen glow still work."
+        }
+    }
+
+    private var iconName: String {
+        switch appState.notificationPermissionStatus {
+        case .authorized:
+            "checkmark.circle.fill"
+        case .denied:
+            "bell.slash.fill"
+        case .requesting:
+            "bell.badge"
+        default:
+            "bell.fill"
+        }
+    }
+
+    private var iconColor: Color {
+        switch appState.notificationPermissionStatus {
+        case .authorized:
+            InspectorColors.good
+        case .denied:
+            InspectorColors.slouch
+        default:
+            InspectorColors.info
+        }
+    }
+
+    private var helpText: String {
+        "\(title). \(message)"
+    }
+}
+
 private struct InspectorHeader: View {
     @EnvironmentObject private var appState: AppState
 
     var body: some View {
         HStack(spacing: 10) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 7)
-                    .fill(InspectorColors.good.opacity(0.14))
-
-                Image(systemName: "figure.seated.side")
-                    .font(.system(size: 16, weight: .semibold))
-                    .foregroundStyle(InspectorColors.good)
-            }
-            .frame(width: 30, height: 30)
+            Image(nsImage: AppIconProvider.image())
+                .resizable()
+                .interpolation(.high)
+                .clipShape(RoundedRectangle(cornerRadius: 7))
+                .frame(width: 30, height: 30)
+                .accessibilityHidden(true)
 
             VStack(alignment: .leading, spacing: 1) {
                 Text("Sloucher")
@@ -983,6 +1153,8 @@ private struct InspectorControls: View {
             .onChange(of: appState.settings.notificationsEnabled) { enabled in
                 if enabled {
                     appState.requestNotificationPermissionIfNeeded()
+                } else {
+                    appState.dismissNotificationSetupForSession()
                 }
             }
     }
@@ -1298,8 +1470,9 @@ private struct PermissionsSetupView: View {
     var body: some View {
         VStack(spacing: 18) {
             VStack(spacing: 8) {
-                Image(nsImage: NSApp.applicationIconImage)
+                Image(nsImage: AppIconProvider.image())
                     .resizable()
+                    .interpolation(.high)
                     .frame(width: 58, height: 58)
                     .clipShape(RoundedRectangle(cornerRadius: 12))
 

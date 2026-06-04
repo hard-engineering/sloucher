@@ -3,6 +3,14 @@
 import AppKit
 import Foundation
 
+// Generates all AppIcon.appiconset PNGs plus the MenuBarIcon template imageset.
+// Artwork tiers (decided 2026-06): point sizes <= 32 get the bold mark-only
+// slouching figure; larger sizes get the desk + monitor scene. The menu bar
+// glyph is the mark-only figure as a black template image.
+//
+// Geometry is authored in a 512x512, y-down design space (matching the SVG
+// sources); drawArtwork() flips CoreGraphics' y-up space accordingly.
+
 struct IconVariant {
     let size: Int
     let scale: Int
@@ -22,9 +30,120 @@ let variants = [
     IconVariant(size: 512, scale: 2, filename: "icon_512x512@2x.png")
 ]
 
-let outputDirectory = URL(fileURLWithPath: "Sloucher/Assets.xcassets/AppIcon.appiconset", isDirectory: true)
+let menuBarVariants = [
+    IconVariant(size: 18, scale: 1, filename: "menubar_18.png"),
+    IconVariant(size: 18, scale: 2, filename: "menubar_18@2x.png")
+]
 
-func drawIcon(pixels: Int) throws -> Data {
+let appIconDirectory = URL(fileURLWithPath: "Sloucher/Assets.xcassets/AppIcon.appiconset", isDirectory: true)
+let menuBarDirectory = URL(fileURLWithPath: "Sloucher/Assets.xcassets/MenuBarIcon.imageset", isDirectory: true)
+
+let teal = NSColor(calibratedRed: 0.0549, green: 0.6235, blue: 0.5569, alpha: 1) // #0E9F8E
+
+enum Artwork {
+    case markOnly
+    case deskScene
+}
+
+// Translate/scale that centers each artwork's bounding box in the 512 design tile.
+struct Fit {
+    let tx: CGFloat
+    let ty: CGFloat
+    let scale: CGFloat
+}
+
+let fitScene = Fit(tx: -81.88, ty: -104.44, scale: 1.10059)
+let fitMark = Fit(tx: -71.87, ty: -174.82, scale: 1.31148)
+let fitMenuBar = Fit(tx: -121.05, ty: -239.44, scale: 1.50820)
+
+func fillRoundedRect(_ c: CGContext, x: CGFloat, y: CGFloat, w: CGFloat, h: CGFloat, r: CGFloat) {
+    let path = CGPath(
+        roundedRect: CGRect(x: x, y: y, width: w, height: h),
+        cornerWidth: min(r, w / 2),
+        cornerHeight: min(r, h / 2),
+        transform: nil
+    )
+    c.addPath(path)
+    c.fillPath()
+}
+
+func setStroke(_ c: CGContext, width: CGFloat) {
+    c.setLineWidth(width)
+    c.setLineCap(.round)
+    c.setLineJoin(.round)
+}
+
+// Seated figure: bent leg, hunched back curving into a forward-craned neck, dropped head.
+func drawFigure(_ c: CGContext, bold: Bool) {
+    setStroke(c, width: bold ? 58 : 42)
+    c.move(to: CGPoint(x: 180, y: 360))
+    c.addLine(to: CGPoint(x: 286, y: 372))
+    c.addLine(to: CGPoint(x: 294, y: 452))
+    c.strokePath()
+
+    setStroke(c, width: bold ? 60 : 44)
+    c.move(to: CGPoint(x: 180, y: 360))
+    if bold {
+        c.addCurve(
+            to: CGPoint(x: 222, y: 232),
+            control1: CGPoint(x: 156, y: 296),
+            control2: CGPoint(x: 172, y: 242)
+        )
+        c.addCurve(
+            to: CGPoint(x: 306, y: 242),
+            control1: CGPoint(x: 258, y: 222),
+            control2: CGPoint(x: 288, y: 230)
+        )
+    } else {
+        c.addCurve(
+            to: CGPoint(x: 220, y: 236),
+            control1: CGPoint(x: 160, y: 300),
+            control2: CGPoint(x: 172, y: 248)
+        )
+        c.addCurve(
+            to: CGPoint(x: 300, y: 242),
+            control1: CGPoint(x: 256, y: 226),
+            control2: CGPoint(x: 282, y: 232)
+        )
+    }
+    c.strokePath()
+
+    let headRadius: CGFloat = bold ? 52 : 42
+    let headCenter = bold ? CGPoint(x: 322, y: 228) : CGPoint(x: 314, y: 224)
+    c.fillEllipse(in: CGRect(
+        x: headCenter.x - headRadius,
+        y: headCenter.y - headRadius,
+        width: headRadius * 2,
+        height: headRadius * 2
+    ))
+}
+
+func drawDeskScene(_ c: CGContext) {
+    fillRoundedRect(c, x: 300, y: 320, w: 176, h: 18, r: 9) // desk top
+    fillRoundedRect(c, x: 428, y: 190, w: 28, h: 112, r: 11) // monitor screen
+    fillRoundedRect(c, x: 437, y: 300, w: 10, h: 13, r: 0) // monitor stand
+    fillRoundedRect(c, x: 420, y: 311, w: 46, h: 9, r: 4.5) // monitor base
+    drawFigure(c, bold: false)
+}
+
+func drawArtwork(_ c: CGContext, _ artwork: Artwork, fit: Fit, pixels: Int, color: NSColor) {
+    c.saveGState()
+    c.translateBy(x: 0, y: CGFloat(pixels))
+    c.scaleBy(x: CGFloat(pixels) / 512, y: -CGFloat(pixels) / 512)
+    c.translateBy(x: fit.tx, y: fit.ty)
+    c.scaleBy(x: fit.scale, y: fit.scale)
+    c.setStrokeColor(color.cgColor)
+    c.setFillColor(color.cgColor)
+    switch artwork {
+    case .markOnly:
+        drawFigure(c, bold: true)
+    case .deskScene:
+        drawDeskScene(c)
+    }
+    c.restoreGState()
+}
+
+func render(pixels: Int, draw: (CGContext) -> Void) throws -> Data {
     guard let bitmap = NSBitmapImageRep(
         bitmapDataPlanes: nil,
         pixelsWide: pixels,
@@ -53,64 +172,7 @@ func drawIcon(pixels: Int) throws -> Data {
     }
 
     context.clear(CGRect(origin: .zero, size: CGSize(width: pixels, height: pixels)))
-
-    let rect = CGRect(origin: .zero, size: CGSize(width: pixels, height: pixels))
-    let radius = CGFloat(pixels) * 0.22
-    let background = CGPath(roundedRect: rect.insetBy(dx: CGFloat(pixels) * 0.04, dy: CGFloat(pixels) * 0.04), cornerWidth: radius, cornerHeight: radius, transform: nil)
-    context.addPath(background)
-    context.clip()
-
-    let colorSpace = CGColorSpaceCreateDeviceRGB()
-    let colors = [
-        NSColor(calibratedRed: 0.05, green: 0.12, blue: 0.14, alpha: 1).cgColor,
-        NSColor(calibratedRed: 0.06, green: 0.33, blue: 0.29, alpha: 1).cgColor
-    ] as CFArray
-    let gradient = CGGradient(colorsSpace: colorSpace, colors: colors, locations: [0, 1])!
-    context.drawLinearGradient(
-        gradient,
-        start: CGPoint(x: rect.minX, y: rect.maxY),
-        end: CGPoint(x: rect.maxX, y: rect.minY),
-        options: []
-    )
-
-    context.resetClip()
-
-    let inset = CGFloat(pixels) * 0.12
-    let inner = rect.insetBy(dx: inset, dy: inset)
-    context.setLineCap(.round)
-    context.setLineJoin(.round)
-
-    context.setStrokeColor(NSColor(calibratedRed: 0.54, green: 0.96, blue: 0.77, alpha: 1).cgColor)
-    context.setLineWidth(max(2, CGFloat(pixels) * 0.055))
-    context.move(to: CGPoint(x: inner.minX + inner.width * 0.08, y: inner.minY + inner.height * 0.34))
-    context.addLine(to: CGPoint(x: inner.maxX - inner.width * 0.10, y: inner.minY + inner.height * 0.34))
-    context.strokePath()
-
-    context.setStrokeColor(NSColor.white.cgColor)
-    context.setLineWidth(max(3, CGFloat(pixels) * 0.075))
-    context.move(to: CGPoint(x: inner.minX + inner.width * 0.34, y: inner.minY + inner.height * 0.21))
-    context.addCurve(
-        to: CGPoint(x: inner.minX + inner.width * 0.48, y: inner.minY + inner.height * 0.70),
-        control1: CGPoint(x: inner.minX + inner.width * 0.42, y: inner.minY + inner.height * 0.34),
-        control2: CGPoint(x: inner.minX + inner.width * 0.34, y: inner.minY + inner.height * 0.58)
-    )
-    context.strokePath()
-
-    context.setFillColor(NSColor.white.cgColor)
-    let headDiameter = CGFloat(pixels) * 0.17
-    let head = CGRect(
-        x: inner.minX + inner.width * 0.50,
-        y: inner.minY + inner.height * 0.66,
-        width: headDiameter,
-        height: headDiameter
-    )
-    context.fillEllipse(in: head)
-
-    context.setStrokeColor(NSColor(calibratedRed: 0.87, green: 0.99, blue: 0.93, alpha: 1).cgColor)
-    context.setLineWidth(max(2, CGFloat(pixels) * 0.052))
-    context.move(to: CGPoint(x: inner.minX + inner.width * 0.34, y: inner.minY + inner.height * 0.48))
-    context.addLine(to: CGPoint(x: inner.minX + inner.width * 0.70, y: inner.minY + inner.height * 0.48))
-    context.strokePath()
+    draw(context)
 
     guard let data = bitmap.representation(using: .png, properties: [:]) else {
         throw CocoaError(.fileWriteUnknown)
@@ -118,12 +180,42 @@ func drawIcon(pixels: Int) throws -> Data {
     return data
 }
 
-try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
+func drawAppIcon(pixels: Int, pointSize: Int, context: CGContext) {
+    let rect = CGRect(origin: .zero, size: CGSize(width: pixels, height: pixels))
+    let radius = CGFloat(pixels) * 0.22
+    let background = CGPath(
+        roundedRect: rect.insetBy(dx: CGFloat(pixels) * 0.04, dy: CGFloat(pixels) * 0.04),
+        cornerWidth: radius,
+        cornerHeight: radius,
+        transform: nil
+    )
+    context.setFillColor(teal.cgColor)
+    context.addPath(background)
+    context.fillPath()
+
+    let artwork: Artwork = pointSize <= 32 ? .markOnly : .deskScene
+    let fit = artwork == .markOnly ? fitMark : fitScene
+    drawArtwork(context, artwork, fit: fit, pixels: pixels, color: .white)
+}
+
+try FileManager.default.createDirectory(at: appIconDirectory, withIntermediateDirectories: true)
+try FileManager.default.createDirectory(at: menuBarDirectory, withIntermediateDirectories: true)
 
 for variant in variants {
     let pixels = variant.size * variant.scale
-    let data = try drawIcon(pixels: pixels)
-    try data.write(to: outputDirectory.appendingPathComponent(variant.filename), options: .atomic)
+    let data = try render(pixels: pixels) { context in
+        drawAppIcon(pixels: pixels, pointSize: variant.size, context: context)
+    }
+    try data.write(to: appIconDirectory.appendingPathComponent(variant.filename), options: .atomic)
 }
 
-print("Wrote \(variants.count) app icon files to \(outputDirectory.path)")
+for variant in menuBarVariants {
+    let pixels = variant.size * variant.scale
+    let data = try render(pixels: pixels) { context in
+        drawArtwork(context, .markOnly, fit: fitMenuBar, pixels: pixels, color: .black)
+    }
+    try data.write(to: menuBarDirectory.appendingPathComponent(variant.filename), options: .atomic)
+}
+
+print("Wrote \(variants.count) app icon files to \(appIconDirectory.path)")
+print("Wrote \(menuBarVariants.count) menu bar icon files to \(menuBarDirectory.path)")

@@ -204,9 +204,12 @@ final class StatusBarWindowController: NSObject, NSWindowDelegate {
     }
 
     private func statusBarImage() -> NSImage? {
-        guard let image = NSApp.applicationIconImage.copy() as? NSImage else { return nil }
+        // Dedicated template glyph (mark-only slouching figure) from the asset
+        // catalog; adapts to light/dark menu bars and stays crisp at 18pt,
+        // unlike the previous scaled-down .icns app icon.
+        guard let image = NSImage(named: "MenuBarIcon") else { return nil }
         image.size = NSSize(width: 18, height: 18)
-        image.isTemplate = false
+        image.isTemplate = true
         return image
     }
 

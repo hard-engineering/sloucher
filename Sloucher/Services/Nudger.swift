@@ -1,8 +1,10 @@
 import AppKit
 import Foundation
+import OSLog
 import UserNotifications
 
 final class Nudger: NSObject, UNUserNotificationCenterDelegate {
+    private let notificationLog = Logger(subsystem: "app.sloucher.Sloucher", category: "notifications")
     private let notificationCenter: UNUserNotificationCenter
     private let overlayWindowController: OverlayWindowController
     private let reminderInterval: TimeInterval
@@ -35,14 +37,16 @@ final class Nudger: NSObject, UNUserNotificationCenterDelegate {
         status: PostureStatus,
         notificationsEnabled: Bool,
         soundEnabled: Bool,
-        overlayEnabled: Bool
+        overlayEnabled: Bool,
+        notificationDelay: TimeInterval = 0
     ) {
         performOnMain { [weak self] in
             self?.applyUpdate(
                 status: status,
                 notificationsEnabled: notificationsEnabled,
                 soundEnabled: soundEnabled,
-                overlayEnabled: overlayEnabled
+                overlayEnabled: overlayEnabled,
+                notificationDelay: notificationDelay
             )
         }
     }
@@ -63,14 +67,18 @@ final class Nudger: NSObject, UNUserNotificationCenterDelegate {
         willPresent notification: UNNotification,
         withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
     ) {
-        completionHandler([.banner, .list])
+        notificationLog.info(
+            "slouch notification willPresent identifier=\(notification.request.identifier, privacy: .public) presentation=banner,list,sound"
+        )
+        completionHandler([.banner, .list, .sound])
     }
 
     private func applyUpdate(
         status: PostureStatus,
         notificationsEnabled: Bool,
         soundEnabled: Bool,
-        overlayEnabled: Bool
+        overlayEnabled: Bool,
+        notificationDelay: TimeInterval
     ) {
         guard status == .slouching else {
             lastStatus = status
@@ -91,7 +99,7 @@ final class Nudger: NSObject, UNUserNotificationCenterDelegate {
 
         if isNewSlouch {
             if notificationsEnabled {
-                sendSlouchNotification()
+                sendSlouchNotification(delay: notificationDelay)
                 lastNotificationDate = now
             } else {
                 lastNotificationDate = nil
@@ -102,7 +110,7 @@ final class Nudger: NSObject, UNUserNotificationCenterDelegate {
             }
             hasPlayedSoundForCurrentSlouch = true
         } else if shouldRenotify(now: now, notificationsEnabled: notificationsEnabled) {
-            sendSlouchNotification()
+            sendSlouchNotification(delay: 0)
             lastNotificationDate = now
         }
 
@@ -115,22 +123,111 @@ final class Nudger: NSObject, UNUserNotificationCenterDelegate {
         return now.timeIntervalSince(lastNotificationDate) >= reminderInterval
     }
 
-    private func sendSlouchNotification() {
+    private func sendSlouchNotification(delay: TimeInterval) {
         notificationSequence += 1
 
         let content = UNMutableNotificationContent()
         content.title = "Slouching"
         content.body = "Sit upright to clear the posture alert."
         content.sound = .default
+        content.interruptionLevel = .active
         content.threadIdentifier = "sloucher.slouch"
 
         let request = UNNotificationRequest(
             identifier: "sloucher.slouch.\(notificationSequence)",
             content: content,
-            trigger: nil
+            trigger: notificationTrigger(delay: delay)
         )
 
-        notificationCenter.add(request)
+        notificationCenter.getNotificationSettings { [notificationCenter, notificationLog] settings in
+            notificationLog.info(
+                "slouch notification add started identifier=\(request.identifier, privacy: .public) authorization=\(Self.authorizationStatusName(settings.authorizationStatus), privacy: .public) alertSetting=\(Self.notificationSettingName(settings.alertSetting), privacy: .public) alertStyle=\(Self.alertStyleName(settings.alertStyle), privacy: .public) soundSetting=\(Self.notificationSettingName(settings.soundSetting), privacy: .public) notificationCenterSetting=\(Self.notificationSettingName(settings.notificationCenterSetting), privacy: .public) interruptionLevel=\(Self.interruptionLevelName(request.content.interruptionLevel), privacy: .public) trigger=\(Self.triggerName(request.trigger), privacy: .public)"
+            )
+            notificationCenter.add(request) { error in
+                if let error {
+                    notificationLog.error(
+                        "slouch notification add failed identifier=\(request.identifier, privacy: .public) error=\(error.localizedDescription, privacy: .public)"
+                    )
+                } else {
+                    notificationLog.info(
+                        "slouch notification add succeeded identifier=\(request.identifier, privacy: .public)"
+                    )
+                }
+            }
+        }
+    }
+
+    private func notificationTrigger(delay: TimeInterval) -> UNNotificationTrigger? {
+        guard delay > 0 else { return nil }
+        return UNTimeIntervalNotificationTrigger(timeInterval: delay, repeats: false)
+    }
+
+    private static func authorizationStatusName(_ status: UNAuthorizationStatus) -> String {
+        switch status {
+        case .notDetermined:
+            "notDetermined"
+        case .denied:
+            "denied"
+        case .authorized:
+            "authorized"
+        case .provisional:
+            "provisional"
+        case .ephemeral:
+            "ephemeral"
+        @unknown default:
+            "unknown"
+        }
+    }
+
+    private static func notificationSettingName(_ setting: UNNotificationSetting) -> String {
+        switch setting {
+        case .notSupported:
+            "notSupported"
+        case .disabled:
+            "disabled"
+        case .enabled:
+            "enabled"
+        @unknown default:
+            "unknown"
+        }
+    }
+
+    private static func alertStyleName(_ style: UNAlertStyle) -> String {
+        switch style {
+        case .none:
+            "none"
+        case .banner:
+            "banner"
+        case .alert:
+            "alert"
+        @unknown default:
+            "unknown"
+        }
+    }
+
+    private static func interruptionLevelName(_ level: UNNotificationInterruptionLevel) -> String {
+        switch level {
+        case .passive:
+            "passive"
+        case .active:
+            "active"
+        case .timeSensitive:
+            "timeSensitive"
+        case .critical:
+            "critical"
+        @unknown default:
+            "unknown"
+        }
+    }
+
+    private static func triggerName(_ trigger: UNNotificationTrigger?) -> String {
+        guard let trigger else { return "immediate" }
+
+        if let timeIntervalTrigger = trigger as? UNTimeIntervalNotificationTrigger {
+            return "timeInterval(\(timeIntervalTrigger.timeInterval)s)"
+        }
+
+        return String(describing: type(of: trigger))
     }
 
     private func playSlouchSound() {
