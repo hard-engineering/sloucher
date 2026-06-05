@@ -65,11 +65,18 @@ final class AppState: ObservableObject {
     @Published private(set) var cameraAuthorization: CameraAuthorization = .notDetermined
     @Published private(set) var hasCheckedCameraAuthorization = false
     @Published private(set) var notificationPermissionStatus: NotificationPermissionStatus = .notDetermined
+    // True after the macOS permission prompt was closed without a decision.
+    // A same-session re-request will not re-present the prompt, so the UI
+    // must route the user to System Settings instead of re-requesting.
+    @Published private(set) var notificationPromptNeedsSystemSettings = false
     @Published private(set) var shouldOfferNotificationTest = false
+    @Published private(set) var didRunNotificationSetupTest = false
+    @Published private(set) var isNotificationSetupDismissed = false
     @Published private(set) var isPermissionSetupVisible = false
     var onInitialBlockingPermissionNeeded: (() -> Void)?
     var onCameraPermissionRequestFinished: (() -> Void)?
     var onCameraPermissionSatisfied: (() -> Void)?
+    var onCalibrationOnboardingNeeded: (() -> Void)?
     @Published var launchAtLoginEnabled: Bool = false {
         didSet {
             guard launchAtLoginEnabled != loginItemManager.isEnabled else { return }
@@ -93,6 +100,7 @@ final class AppState: ObservableObject {
     private let analysisQueue = DispatchQueue(label: "app.sloucher.analysis", qos: .utility)
     private let imageContext = CIContext(options: [.cacheIntermediates: false])
     private let testNudgeNotificationDelay: TimeInterval = 1
+    private let testNudgePreviewDuration: TimeInterval = 4
     private var cancellables: Set<AnyCancellable> = []
     private var isManuallyPaused = false
     private var isPowerPaused = false
@@ -116,8 +124,7 @@ final class AppState: ObservableObject {
     private var nextForensicCaptureAllowedAt = Date.distantPast
     private var permissionPollingTimer: Timer?
     private var cameraFrameWaitID: UUID?
-    private var isNotificationSetupDismissed = false
-
+    private var testNudgePreviewID: UUID?
     private struct RawPlaneDump {
         let name: String
         let data: Data
@@ -162,12 +169,26 @@ final class AppState: ObservableObject {
         case .notDetermined, .requesting, .provisional, .denied:
             return true
         case .authorized:
-            return shouldOfferNotificationTest
+            return shouldOfferNotificationTest || didRunNotificationSetupTest
         }
     }
 
     var shouldShowPermissionSetup: Bool {
-        cameraAuthorization != .authorized
+        cameraAuthorization != .authorized || isPermissionSetupFlowActive
+    }
+
+    // Keeps the setup flow on screen after the camera is granted so the user
+    // can finish the consolidated permissions page (notifications) and leave
+    // it deliberately via Continue. Not persisted: a relaunch with the camera
+    // already authorized goes straight to the inspector.
+    @Published private(set) var isPermissionSetupFlowActive = false
+
+    func beginPermissionSetupFlow() {
+        isPermissionSetupFlowActive = true
+    }
+
+    func finishPermissionSetupFlow() {
+        isPermissionSetupFlowActive = false
     }
 
     var displayBaselineDistance: Double? {
@@ -394,30 +415,21 @@ final class AppState: ObservableObject {
         stopCamera()
     }
 
-    func testNudge() {
+    func testNudge(fromNotificationSetup: Bool = false) {
         guard settings.notificationsEnabled else {
-            settings.notificationsEnabled = true
-            isNotificationSetupDismissed = false
-
-            switch notificationPermissionStatus {
-            case .denied:
-                shouldOfferNotificationTest = false
-                detailText = "Notifications are off in macOS. Open Settings to enable banners."
-                publishRuntimeDiagnostics(status: status, detail: detailText, metrics: latestMetrics)
-                showNotificationSettingsAlert()
-            case .authorized:
-                fireTestNudge()
-            case .notDetermined, .requesting, .provisional:
-                detailText = "Notifications were off in Sloucher. Enable macOS notifications to test banners."
-                publishRuntimeDiagnostics(status: status, detail: detailText, metrics: latestMetrics)
-                requestNotificationPermissionForTestNudge()
-            }
+            shouldOfferNotificationTest = false
+            didRunNotificationSetupTest = false
+            notificationLog.info(
+                "test nudge leaving app notifications disabled permission=\(self.notificationPermissionStatus.diagnosticsName, privacy: .public)"
+            )
+            detailText = "Notifications are off in Sloucher. Testing sound and screen glow only."
+            fireTestNudge(keepNotificationSetupVisible: false)
             return
         }
 
         switch notificationPermissionStatus {
         case .notDetermined, .provisional:
-            requestNotificationPermissionForTestNudge()
+            requestNotificationPermissionForTestNudge(fromNotificationSetup: true)
         case .requesting:
             isNotificationSetupDismissed = false
             detailText = "Waiting for notification permission."
@@ -425,15 +437,16 @@ final class AppState: ObservableObject {
         case .denied:
             isNotificationSetupDismissed = false
             shouldOfferNotificationTest = false
+            didRunNotificationSetupTest = false
             detailText = "Notifications are off in macOS. Open Settings to enable banners."
             publishRuntimeDiagnostics(status: status, detail: detailText, metrics: latestMetrics)
             showNotificationSettingsAlert()
         case .authorized:
-            fireTestNudge()
+            fireTestNudge(keepNotificationSetupVisible: fromNotificationSetup)
         }
     }
 
-    private func requestNotificationPermissionForTestNudge() {
+    private func requestNotificationPermissionForTestNudge(fromNotificationSetup: Bool) {
         isNotificationSetupDismissed = false
         detailText = "Allow notifications to test a banner."
         publishRuntimeDiagnostics(status: status, detail: detailText, metrics: latestMetrics)
@@ -445,36 +458,48 @@ final class AppState: ObservableObject {
             guard let self else { return }
 
             if self.notificationPermissionStatus.canScheduleNotifications {
-                self.fireTestNudge()
+                self.fireTestNudge(keepNotificationSetupVisible: fromNotificationSetup)
             } else {
                 self.isNotificationSetupDismissed = false
                 self.shouldOfferNotificationTest = false
+                self.didRunNotificationSetupTest = false
                 self.publishRuntimeDiagnostics(status: self.status, detail: self.detailText, metrics: self.latestMetrics)
             }
         }
     }
 
-    private func fireTestNudge() {
+    private func fireTestNudge(keepNotificationSetupVisible: Bool = false) {
         if detailText?.hasPrefix("Notifications") != true {
             detailText = "Testing notification, sound, and glow."
         }
-        shouldOfferNotificationTest = false
+        if keepNotificationSetupVisible {
+            shouldOfferNotificationTest = true
+            didRunNotificationSetupTest = true
+            isNotificationSetupDismissed = false
+            detailText = "Test nudge sent."
+        } else {
+            shouldOfferNotificationTest = false
+            didRunNotificationSetupTest = false
+        }
         isNudgePreviewActive = true
+        let previewID = UUID()
+        testNudgePreviewID = previewID
         publishRuntimeDiagnostics(status: status, detail: detailText, metrics: latestMetrics)
 
-        nudger.update(
-            status: .slouching,
+        nudger.testNudge(
             notificationsEnabled: notificationNudgesEnabled,
             soundEnabled: settings.soundEnabled,
             overlayEnabled: settings.overlayEnabled,
-            notificationDelay: testNudgeNotificationDelay
+            notificationDelay: testNudgeNotificationDelay,
+            previewDuration: testNudgePreviewDuration
         )
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + testNudgePreviewDuration) { [weak self] in
             guard let self else { return }
+            guard self.testNudgePreviewID == previewID else { return }
+            self.testNudgePreviewID = nil
             self.isNudgePreviewActive = false
             guard self.status != .slouching else { return }
-            self.nudger.clear()
             self.detailText = self.hasBaseline ? nil : "Calibrate once while sitting upright."
             self.publishRuntimeDiagnostics(status: self.status, detail: self.detailText, metrics: self.latestMetrics)
         }
@@ -524,6 +549,9 @@ final class AppState: ObservableObject {
     }
 
     func quit() {
+        if shouldShowNotificationSetupPanel {
+            dismissNotificationSetupForSession(reason: "quit")
+        }
         stopCamera()
         nudger.clear()
         NSApp.terminate(nil)
@@ -659,24 +687,30 @@ final class AppState: ObservableObject {
                 self.notificationLog.info(
                     "explicit notification authorization completed granted=\(granted, privacy: .public)"
                 )
-                self.refreshNotificationPermissionStatus {
+                self.refreshNotificationPermissionStatus(force: true) {
                     switch self.notificationPermissionStatus {
                     case .authorized:
                         self.shouldOfferNotificationTest = true
+                        self.didRunNotificationSetupTest = false
                         self.detailText = "Notifications enabled. Test a nudge."
                     case .denied:
                         self.shouldOfferNotificationTest = false
+                        self.didRunNotificationSetupTest = false
                         self.detailText = "Notifications are off. Sound and screen glow still work."
                     case .provisional:
                         self.shouldOfferNotificationTest = false
+                        self.didRunNotificationSetupTest = false
                         self.detailText = "Notifications are still quiet. Enable banners in System Settings."
                     case .notDetermined, .requesting:
-                        break
+                        // Prompt was closed without a decision.
+                        self.notificationPromptNeedsSystemSettings = true
+                        self.detailText = "The notification prompt was dismissed. Enable notifications for Sloucher in System Settings."
                     }
 
                     self.publishRuntimeDiagnostics(status: self.status, detail: self.detailText, metrics: self.latestMetrics)
                     if self.cameraAuthorization == .authorized &&
-                        self.notificationPermissionStatus != .requesting {
+                        self.notificationPermissionStatus != .requesting &&
+                        !self.notificationPromptNeedsSystemSettings {
                         self.stopPermissionPolling()
                     }
                     completion?()
@@ -707,24 +741,46 @@ final class AppState: ObservableObject {
         }
     }
 
-    func dismissNotificationSetupForSession() {
+    func dismissNotificationSetupForSession(reason: String = "button") {
+        notificationLog.info(
+            "notification setup dismissed reason=\(reason, privacy: .public) permission=\(self.notificationPermissionStatus.diagnosticsName, privacy: .public) offerTest=\(self.shouldOfferNotificationTest, privacy: .public) didRunTest=\(self.didRunNotificationSetupTest, privacy: .public)"
+        )
+        runtimeDefaults.set(reason, forKey: RuntimeKeys.notificationSetupDismissReason)
+        runtimeDefaults.set(Date(), forKey: RuntimeKeys.notificationSetupDismissedAt)
         isNotificationSetupDismissed = true
         shouldOfferNotificationTest = false
+        didRunNotificationSetupTest = false
     }
 
     func closePermissionSetup() {
         isPermissionSetupVisible = false
     }
 
-    private func refreshNotificationPermissionStatus(completion: (() -> Void)? = nil) {
+    private func refreshNotificationPermissionStatus(force: Bool = false, completion: (() -> Void)? = nil) {
         UNUserNotificationCenter.current().getNotificationSettings { [weak self] settings in
             let status = Self.notificationPermissionStatus(from: settings.authorizationStatus)
 
             DispatchQueue.main.async {
                 guard let self else { return }
-                let nextStatus = self.notificationPermissionStatus == .requesting && status == .notDetermined
-                    ? .requesting
-                    : status
+                // While an explicit request is in flight, the macOS prompt is still
+                // open and getNotificationSettings() can report a not-yet-final
+                // status (often .denied). Only the requestAuthorization completion
+                // handler (force: true) is allowed to resolve the strip — background
+                // polling must hold .requesting so the UI doesn't flip before the
+                // user answers the prompt.
+                let nextStatus: NotificationPermissionStatus
+                if self.notificationPermissionStatus == .requesting && !force {
+                    nextStatus = .requesting
+                } else {
+                    nextStatus = status
+                }
+                if nextStatus == .authorized || nextStatus == .denied || nextStatus == .provisional,
+                   self.notificationPromptNeedsSystemSettings {
+                    self.notificationPromptNeedsSystemSettings = false
+                    if self.cameraAuthorization == .authorized {
+                        self.stopPermissionPolling()
+                    }
+                }
                 let previousStatus = self.notificationPermissionStatus
                 self.notificationPermissionStatus = nextStatus
                 self.runtimeDefaults.set(nextStatus.diagnosticsName, forKey: RuntimeKeys.notificationPermissionStatus)
@@ -1013,6 +1069,7 @@ final class AppState: ObservableObject {
                     self.detailText = "Calibrated."
                     self.isNotificationSetupDismissed = false
                     self.shouldOfferNotificationTest = false
+                    self.didRunNotificationSetupTest = false
 
                     if let calibrationMetrics {
                         self.updatePostureScore(with: calibrationMetrics, status: .good)
@@ -1179,7 +1236,7 @@ final class AppState: ObservableObject {
 
         publishRuntimeDiagnostics(status: nextStatus, detail: detailText, metrics: liveMetrics)
         if wasWaitingForFirstFrame {
-            showCalibrationHintIfNeeded()
+            presentCalibrationOnboardingIfNeeded()
         }
 
         nudger.update(
@@ -1395,21 +1452,15 @@ final class AppState: ObservableObject {
         return "Couldn't calibrate. Collected \(bodySamples) valid samples from \(bodySuccesses) body frames; need more stable head and shoulder tracking.\(issue)"
     }
 
-    private func showCalibrationHintIfNeeded() {
+    private func presentCalibrationOnboardingIfNeeded() {
         guard !hasBaseline else { return }
         guard !runtimeDefaults.bool(forKey: RuntimeKeys.didShowCalibrationHint) else { return }
         runtimeDefaults.set(true, forKey: RuntimeKeys.didShowCalibrationHint)
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
-            guard let self, !self.hasBaseline else { return }
-
-            let alert = NSAlert()
-            alert.alertStyle = .informational
-            alert.messageText = "Calibrate Sloucher once"
-            alert.informativeText = "The camera is on, but posture alerts need a baseline. Sit upright, click the Sloucher menu-bar icon, then choose Calibrate."
-            alert.addButton(withTitle: "OK")
-            alert.runModal()
-        }
+        // First frame arrived with no baseline: make sure the inspector is
+        // visible — its inline step-2 panel owns calibration. Replaces the
+        // old delayed NSAlert, which duplicated the panel as a modal.
+        onCalibrationOnboardingNeeded?()
     }
 
     private func publishRuntimeDiagnostics(
@@ -2266,6 +2317,8 @@ final class AppState: ObservableObject {
 
     private enum RuntimeKeys {
         static let notificationPermissionStatus = "runtime.notification.permissionStatus"
+        static let notificationSetupDismissReason = "runtime.notification.setup.dismissReason"
+        static let notificationSetupDismissedAt = "runtime.notification.setup.dismissedAt"
         static let didShowCalibrationHint = "runtime.didShowCalibrationHint"
         static let status = "runtime.status"
         static let statusDisplayName = "runtime.statusDisplayName"

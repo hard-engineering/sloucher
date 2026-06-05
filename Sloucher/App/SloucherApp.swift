@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import QuartzCore
 import SwiftUI
 
 @main
@@ -36,14 +37,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-final class StatusBarWindowController: NSObject, NSWindowDelegate {
+final class StatusBarWindowController: NSObject, NSMenuDelegate, NSWindowDelegate {
     private let mainWindowFrameSize = NSSize(width: 700, height: 660)
     private let mainWindowMinimumSize = NSSize(width: 700, height: 540)
+    private let notificationSetupPanelHeightAllowance: CGFloat = 68
+    private let mainWindowResizeDuration: TimeInterval = 0.18
     private let appState: AppState
     private let statusItem: NSStatusItem
     private var window: NSWindow?
     private lazy var statusContextMenu: NSMenu = makeStatusMenu()
+    private weak var calibrationMenuItem: NSMenuItem?
     private var cancellables: Set<AnyCancellable> = []
+    private var lastNotificationSetupPanelVisible = false
+    private var pendingWindowResize: DispatchWorkItem?
     private var didHandleInitialCameraStatus = false
 
     init(appState: AppState) {
@@ -53,6 +59,7 @@ final class StatusBarWindowController: NSObject, NSWindowDelegate {
         configureStatusItem()
         configureAppStateCallbacks()
         observeInitialCameraStatus()
+        observeNotificationSetupPanelVisibility()
     }
 
     private func configureStatusItem() {
@@ -88,6 +95,13 @@ final class StatusBarWindowController: NSObject, NSWindowDelegate {
         appState.quit()
     }
 
+    @objc private func recalibrateSloucher() {
+        appState.refreshPermissionStatuses()
+        presentMainWindow(activate: true)
+        guard appState.cameraAuthorization == .authorized, appState.canCalibrate else { return }
+        appState.startCalibration()
+    }
+
     private func observeInitialCameraStatus() {
         appState.$hasCheckedCameraAuthorization
             .combineLatest(appState.$cameraAuthorization)
@@ -111,6 +125,12 @@ final class StatusBarWindowController: NSObject, NSWindowDelegate {
             self?.presentMainWindow(activate: true)
         }
         appState.onCameraPermissionSatisfied = { [weak self] in
+            self?.presentMainWindow(activate: true)
+        }
+        appState.onCalibrationOnboardingNeeded = { [weak self] in
+            // The inline step-2 panel handles calibration; just make sure the
+            // window is on screen. No auto-start: the user should settle into
+            // their sit-tall posture before sampling begins.
             self?.presentMainWindow(activate: true)
         }
     }
@@ -141,6 +161,7 @@ final class StatusBarWindowController: NSObject, NSWindowDelegate {
             window = mainWindow
             center(mainWindow)
         }
+        lastNotificationSetupPanelVisible = appState.shouldShowNotificationSetupPanel
 
         if mainWindow.isMiniaturized {
             mainWindow.deminiaturize(nil)
@@ -150,6 +171,8 @@ final class StatusBarWindowController: NSObject, NSWindowDelegate {
         if activate {
             NSApp.activate(ignoringOtherApps: true)
         }
+
+        scheduleMainWindowResize(animated: false)
     }
 
     private func makeMainWindow() -> NSWindow {
@@ -157,7 +180,12 @@ final class StatusBarWindowController: NSObject, NSWindowDelegate {
             .environmentObject(appState)
         let hostingController = NSHostingController(rootView: contentView)
         let mainWindow = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: mainWindowFrameSize.width, height: mainWindowFrameSize.height),
+            contentRect: NSRect(
+                x: 0,
+                y: 0,
+                width: mainWindowFrameSize.width,
+                height: targetMainWindowContentHeight
+            ),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
@@ -173,6 +201,76 @@ final class StatusBarWindowController: NSObject, NSWindowDelegate {
         return mainWindow
     }
 
+    private var targetMainWindowContentHeight: CGFloat {
+        // The setup strip occupies about 56pt plus the root VStack's 12pt spacing.
+        return appState.shouldShowNotificationSetupPanel
+            ? mainWindowFrameSize.height
+            : mainWindowFrameSize.height - notificationSetupPanelHeightAllowance
+    }
+
+    private func observeNotificationSetupPanelVisibility() {
+        appState.objectWillChange
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                DispatchQueue.main.async {
+                    self?.applyNotificationSetupPanelVisibility()
+                }
+            }
+            .store(in: &cancellables)
+    }
+
+    private func applyNotificationSetupPanelVisibility() {
+        let isVisible = appState.shouldShowNotificationSetupPanel
+        guard isVisible != lastNotificationSetupPanelVisible else { return }
+
+        lastNotificationSetupPanelVisible = isVisible
+        scheduleMainWindowResize(animated: true, delay: isVisible ? 0 : mainWindowResizeDuration)
+    }
+
+    private func scheduleMainWindowResize(animated: Bool, delay: TimeInterval = 0) {
+        pendingWindowResize?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.resizeMainWindowToCurrentContent(animated: animated)
+        }
+        pendingWindowResize = work
+
+        if delay > 0 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+        } else {
+            DispatchQueue.main.async(execute: work)
+        }
+    }
+
+    private func resizeMainWindowToCurrentContent(animated: Bool) {
+        guard let window else { return }
+
+        let currentContentRect = window.contentRect(forFrameRect: window.frame)
+        let targetContentHeight = targetMainWindowContentHeight
+        guard abs(currentContentRect.height - targetContentHeight) > 1 else { return }
+
+        let targetContentRect = NSRect(
+            origin: .zero,
+            size: NSSize(width: currentContentRect.width, height: targetContentHeight)
+        )
+        let targetFrameSize = window.frameRect(forContentRect: targetContentRect).size
+        let targetFrame = NSRect(
+            x: window.frame.minX,
+            y: window.frame.maxY - targetFrameSize.height,
+            width: window.frame.width,
+            height: targetFrameSize.height
+        )
+
+        if animated {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = mainWindowResizeDuration
+                context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                window.animator().setFrame(targetFrame, display: true)
+            }
+        } else {
+            window.setFrame(targetFrame, display: true)
+        }
+    }
+
     private func center(_ window: NSWindow) {
         guard let screen = NSScreen.main else {
             window.center()
@@ -182,7 +280,7 @@ final class StatusBarWindowController: NSObject, NSWindowDelegate {
         let visibleFrame = screen.visibleFrame
         let frameSize = NSSize(
             width: max(window.frame.width, mainWindowFrameSize.width),
-            height: min(max(window.frame.height, mainWindowFrameSize.height), max(mainWindowMinimumSize.height, visibleFrame.height - 24))
+            height: min(max(window.frame.height, mainWindowMinimumSize.height), max(mainWindowMinimumSize.height, visibleFrame.height - 24))
         )
         let centeredX = visibleFrame.midX - frameSize.width / 2
         let centeredY = visibleFrame.midY - frameSize.height / 2
@@ -215,14 +313,31 @@ final class StatusBarWindowController: NSObject, NSWindowDelegate {
 
     private func makeStatusMenu() -> NSMenu {
         let menu = NSMenu()
+        menu.delegate = self
         let openItem = NSMenuItem(title: "Open Sloucher", action: #selector(openSloucher), keyEquivalent: "")
         openItem.target = self
         menu.addItem(openItem)
+        let calibrationItem = NSMenuItem(title: "Recalibrate", action: #selector(recalibrateSloucher), keyEquivalent: "")
+        calibrationItem.target = self
+        menu.addItem(calibrationItem)
+        calibrationMenuItem = calibrationItem
         menu.addItem(.separator())
         let quitItem = NSMenuItem(title: "Quit", action: #selector(quitSloucher), keyEquivalent: "")
         quitItem.target = self
         menu.addItem(quitItem)
         return menu
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        appState.refreshPermissionStatuses()
+        calibrationMenuItem?.title = appState.hasBaseline ? "Recalibrate" : "Calibrate"
+        calibrationMenuItem?.isEnabled = canUseCalibrationMenu
+    }
+
+    private var canUseCalibrationMenu: Bool {
+        appState.hasCheckedCameraAuthorization &&
+            appState.cameraAuthorization == .authorized &&
+            appState.canCalibrate
     }
 
     private func showStatusMenu(from button: NSStatusBarButton) {
@@ -234,6 +349,10 @@ final class StatusBarWindowController: NSObject, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
+        if appState.shouldShowNotificationSetupPanel {
+            // Closing the menu-bar window means the user ignored this in-session onboarding strip.
+            appState.dismissNotificationSetupForSession(reason: "windowClose")
+        }
         window = nil
     }
 }

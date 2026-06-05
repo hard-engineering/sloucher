@@ -31,12 +31,27 @@ struct MainWindowRootView: View {
 struct MenuBarView: View {
     @EnvironmentObject private var appState: AppState
 
+    // De-emphasize sections that are meaningless before a baseline exists,
+    // keeping first-run focus on the calibration panel and the live preview.
+    private var onboardingDim: Double {
+        appState.hasBaseline ? 1 : 0.45
+    }
+
     var body: some View {
         VStack(spacing: 12) {
             InspectorHeader()
 
-            if let guidance = appState.inspectorGuidanceText {
-                InspectorGuidance(text: guidance, status: appState.status)
+            if !appState.hasBaseline {
+                CalibrationOnboardingPanel()
+            } else {
+                if appState.shouldShowNotificationSetupPanel {
+                    NotificationSetupPanel()
+                        .transition(.opacity.combined(with: .move(edge: .top)))
+                }
+
+                if let guidance = appState.inspectorGuidanceText {
+                    InspectorGuidance(text: guidance, status: appState.status)
+                }
             }
 
             HStack(alignment: .top, spacing: 12) {
@@ -45,18 +60,18 @@ struct MenuBarView: View {
 
                 MetricsPanel()
                     .frame(width: 291)
+                    .opacity(onboardingDim)
             }
 
             SparklineCard()
                 .frame(height: 86)
+                .opacity(onboardingDim)
 
             InspectorControls()
-
-            if appState.shouldShowNotificationSetupPanel {
-                NotificationSetupPanel()
-            }
+                .opacity(onboardingDim)
 
             UtilityControls()
+                .opacity(onboardingDim)
         }
         .padding(14)
         .frame(width: 680)
@@ -66,6 +81,9 @@ struct MenuBarView: View {
         .onDisappear {
             appState.setInspectorVisible(false)
         }
+        .animation(.easeInOut(duration: 0.18), value: appState.shouldShowNotificationSetupPanel)
+        .animation(.easeInOut(duration: 0.18), value: appState.didRunNotificationSetupTest)
+        .animation(.easeInOut(duration: 0.18), value: appState.hasBaseline)
     }
 }
 
@@ -123,44 +141,136 @@ private struct InspectorGuidance: View {
     }
 }
 
+// Step 2 of first-launch setup. Shown in place of the guidance strip until a
+// posture baseline exists, continuing the 3-step flow from PermissionsSetupView.
+private struct CalibrationOnboardingPanel: View {
+    @EnvironmentObject private var appState: AppState
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            SetupStepsRow(currentStep: 2)
+
+            HStack(alignment: .center, spacing: 12) {
+                Text(instruction)
+                    .font(.system(size: 13))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Spacer(minLength: 8)
+
+                if isCalibrating {
+                    HStack(spacing: 8) {
+                        ProgressView(value: calibrationProgress)
+                            .progressViewStyle(.linear)
+                            .frame(width: 110)
+
+                        Text("\(appState.calibrationBodySamples)/\(appState.calibrationRequiredSamples)")
+                            .font(.system(size: 12, weight: .medium, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: true, vertical: false)
+                    }
+                } else {
+                    Button {
+                        appState.startCalibration()
+                    } label: {
+                        Label("Calibrate", systemImage: "scope")
+                            .fixedSize(horizontal: true, vertical: false)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(InspectorColors.brand)
+                    .disabled(!appState.canCalibrate)
+                    .help("Capture your upright posture as the baseline")
+                }
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 14)
+        .background(InspectorColors.brand.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(InspectorColors.brand.opacity(0.18), lineWidth: 1)
+        )
+    }
+
+    // One line, one slot: the instruction normally, the live tracking hint
+    // when something blocks calibration, progress guidance while sampling.
+    private var instruction: String {
+        if isCalibrating {
+            return "Hold that posture for a few seconds."
+        }
+
+        if !appState.canCalibrate, let hint = appState.inspectorGuidanceText {
+            return hint
+        }
+
+        return "Sit tall with your head and shoulders in view."
+    }
+
+    private var isCalibrating: Bool {
+        appState.status == .calibrating
+    }
+
+    private var calibrationProgress: Double {
+        guard appState.calibrationRequiredSamples > 0 else { return 0 }
+        return Double(appState.calibrationBodySamples) / Double(appState.calibrationRequiredSamples)
+    }
+}
+
 private struct NotificationSetupPanel: View {
     @EnvironmentObject private var appState: AppState
 
     var body: some View {
-        HStack(alignment: .center, spacing: 10) {
-            ZStack {
-                Circle()
-                    .fill(iconColor.opacity(0.14))
-
-                Image(systemName: iconName)
-                    .font(.system(size: 17, weight: .semibold))
-                    .foregroundStyle(iconColor)
-            }
-            .frame(width: 38, height: 38)
-
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.system(size: 13, weight: .semibold))
-                    .fixedSize(horizontal: false, vertical: true)
-
-                Text(message)
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+        VStack(alignment: .leading, spacing: 12) {
+            if showsOnboardingSteps {
+                SetupStepsRow(currentStep: 3)
             }
 
-            Spacer(minLength: 8)
+            HStack(alignment: .center, spacing: 12) {
+                ZStack {
+                    Circle()
+                        .fill(iconColor.opacity(0.14))
 
-            actions
+                    Image(systemName: iconName)
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundStyle(iconColor)
+                }
+                .frame(width: 38, height: 38)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(title)
+                        .font(.system(size: 13, weight: .semibold))
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    Text(message)
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Spacer(minLength: 8)
+
+                actions
+            }
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 9)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
         .background(iconColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
         .overlay(
             RoundedRectangle(cornerRadius: 8)
                 .stroke(iconColor.opacity(0.16), lineWidth: 1)
         )
         .help(helpText)
+    }
+
+    // The steps row is an onboarding cue: show it only for the first-time
+    // permission ask, not when the panel resurfaces later (denied/test states).
+    private var showsOnboardingSteps: Bool {
+        switch appState.notificationPermissionStatus {
+        case .notDetermined, .requesting, .provisional:
+            true
+        case .denied, .authorized:
+            false
+        }
     }
 
     @ViewBuilder
@@ -182,20 +292,38 @@ private struct NotificationSetupPanel: View {
     private var primaryAction: some View {
         switch appState.notificationPermissionStatus {
         case .notDetermined, .provisional:
-            Button {
-                appState.requestNotificationPermissionIfNeeded()
-            } label: {
-                Label("Enable Notifications", systemImage: "bell.fill")
-                    .fixedSize(horizontal: true, vertical: false)
+            if appState.notificationPromptNeedsSystemSettings {
+                Button {
+                    appState.openNotificationSettings()
+                } label: {
+                    Label("Open System Settings", systemImage: "gearshape")
+                        .fixedSize(horizontal: true, vertical: false)
+                }
+                .help("Turn on notifications for Sloucher in System Settings")
+            } else {
+                Button {
+                    appState.requestNotificationPermissionIfNeeded()
+                } label: {
+                    Label("Enable Notifications", systemImage: "bell.fill")
+                        .fixedSize(horizontal: true, vertical: false)
+                }
+                .help("Enable notification banners and sound")
             }
-            .help("Enable notification banners and sound")
         case .requesting:
-            HStack(spacing: 6) {
-                ProgressView()
-                    .controlSize(.small)
-                Text("Waiting...")
-                    .font(.system(size: 12, weight: .medium))
-                    .fixedSize(horizontal: true, vertical: false)
+            VStack(alignment: .trailing, spacing: 4) {
+                HStack(spacing: 6) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Waiting...")
+                        .font(.system(size: 12, weight: .medium))
+                        .fixedSize(horizontal: true, vertical: false)
+                }
+
+                Button("Open System Settings") {
+                    appState.openNotificationSettings()
+                }
+                .buttonStyle(.link)
+                .font(.system(size: 12))
             }
         case .denied:
             Button {
@@ -207,9 +335,9 @@ private struct NotificationSetupPanel: View {
             .help("Open Notification settings")
         case .authorized:
             Button {
-                appState.testNudge()
+                appState.testNudge(fromNotificationSetup: true)
             } label: {
-                Label("Test nudge", systemImage: "bell.fill")
+                Label(appState.didRunNotificationSetupTest ? "Test again" : "Test nudge", systemImage: "bell.fill")
                     .fixedSize(horizontal: true, vertical: false)
             }
             .help("Test notification, sound, and screen glow")
@@ -218,9 +346,11 @@ private struct NotificationSetupPanel: View {
 
     private var secondaryAction: some View {
         Button(appState.notificationPermissionStatus == .authorized ? "Done" : "Not Now") {
-            appState.dismissNotificationSetupForSession()
+            appState.dismissNotificationSetupForSession(reason: "button")
         }
-        .controlSize(.small)
+        .buttonStyle(.plain)
+        .font(.system(size: 12, weight: .medium))
+        .foregroundStyle(.secondary)
         .fixedSize(horizontal: true, vertical: false)
         .help(appState.notificationPermissionStatus == .authorized ? "Dismiss" : "Skip for now")
     }
@@ -228,13 +358,15 @@ private struct NotificationSetupPanel: View {
     private var title: String {
         switch appState.notificationPermissionStatus {
         case .notDetermined:
-            "Enable posture nudges"
+            appState.notificationPromptNeedsSystemSettings
+                ? "Finish turning on notifications"
+                : "Enable posture nudges"
         case .requesting:
             "Waiting for notification permission"
         case .provisional:
             "Enable notification banners"
         case .authorized:
-            "Notifications enabled"
+            appState.didRunNotificationSetupTest ? "Test nudge sent" : "Notifications enabled"
         case .denied:
             "Notifications are off"
         }
@@ -243,13 +375,15 @@ private struct NotificationSetupPanel: View {
     private var message: String {
         switch appState.notificationPermissionStatus {
         case .notDetermined:
-            "Sloucher can show a banner and sound when posture drops."
+            appState.notificationPromptNeedsSystemSettings
+                ? "The prompt was dismissed — finish in System Settings."
+                : "A banner and sound when posture drops."
         case .requesting:
             "Respond to the macOS permission prompt."
         case .provisional:
             "Sloucher is currently quiet in Notification Centre."
         case .authorized:
-            "Run one test to confirm the full nudge path."
+            appState.didRunNotificationSetupTest ? "If the banner appeared, notifications are ready." : "Run one test to confirm the full nudge path."
         case .denied:
             "Sound and screen glow still work."
         }
@@ -274,8 +408,10 @@ private struct NotificationSetupPanel: View {
             InspectorColors.good
         case .denied:
             InspectorColors.slouch
-        default:
-            InspectorColors.info
+        case .notDetermined, .requesting, .provisional:
+            // Match the teal onboarding language of steps 1-2, not the blue
+            // info accent used elsewhere in the inspector.
+            InspectorColors.brand
         }
     }
 
@@ -1154,7 +1290,7 @@ private struct InspectorControls: View {
                 if enabled {
                     appState.requestNotificationPermissionIfNeeded()
                 } else {
-                    appState.dismissNotificationSetupForSession()
+                    appState.dismissNotificationSetupForSession(reason: "notificationsToggleOff")
                 }
             }
     }
@@ -1466,45 +1602,107 @@ private struct NudgeIndicators: View {
 
 private struct PermissionsSetupView: View {
     @EnvironmentObject private var appState: AppState
+    @State private var page = Page.welcome
+
+    private enum Page {
+        case welcome
+        case permissions
+    }
 
     var body: some View {
-        VStack(spacing: 18) {
-            VStack(spacing: 8) {
-                Image(nsImage: AppIconProvider.image())
-                    .resizable()
-                    .interpolation(.high)
-                    .frame(width: 58, height: 58)
-                    .clipShape(RoundedRectangle(cornerRadius: 12))
-
-                Text("Sloucher")
-                    .font(.system(size: 24, weight: .semibold))
-                    .fixedSize(horizontal: true, vertical: false)
-
-                Text("Set Up Sloucher")
-                    .font(.system(size: 15, weight: .medium))
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: true, vertical: false)
-
-                Text("Camera access is required for posture detection.")
-                    .font(.system(size: 13))
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-
-            VStack(spacing: 10) {
-                PermissionCard(
-                    iconName: "camera.fill",
-                    title: "Camera",
-                    description: "Measures posture locally from your Mac camera.",
-                    state: cameraCardState,
-                    primaryAction: cameraPrimaryAction,
-                    settingsAction: appState.openCameraSettings
-                )
+        Group {
+            switch page {
+            case .welcome:
+                welcome
+            case .permissions:
+                permissions
             }
         }
         .padding(24)
-        .frame(maxWidth: 520)
+        .frame(maxWidth: 580)
+        .animation(.easeInOut(duration: 0.2), value: page)
+        .onAppear {
+            if appState.cameraAuthorization == .authorized {
+                appState.finishPermissionSetupFlow()
+            } else {
+                appState.beginPermissionSetupFlow()
+            }
+        }
+        .onChange(of: appState.cameraAuthorization) { authorization in
+            // Granting the camera is the continue: move straight to the main
+            // screen, where the focused calibration step takes over.
+            if authorization == .authorized {
+                appState.finishPermissionSetupFlow()
+            }
+        }
+    }
+
+    private var welcome: some View {
+        VStack(spacing: 0) {
+            SlouchHeroView()
+
+            Text("Sit better, without thinking about it.")
+                .font(.system(size: 26, weight: .semibold))
+                .fixedSize(horizontal: false, vertical: true)
+                .multilineTextAlignment(.center)
+                .padding(.top, 24)
+
+            Text("Sloucher watches your posture through your Mac's camera and nudges you the moment you start to slouch — until sitting tall is a habit, not a chore.")
+                .font(.system(size: 13))
+                .lineSpacing(3)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: 430)
+                .padding(.top, 10)
+
+            SetupStepsRow()
+                .padding(.top, 26)
+
+            Button {
+                page = .permissions
+            } label: {
+                Text("Get started")
+                    .font(.system(size: 14, weight: .medium))
+                    .padding(.horizontal, 26)
+                    .padding(.vertical, 3)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(InspectorColors.brand)
+            .keyboardShortcut(.defaultAction)
+            .padding(.top, 26)
+
+            Label("Sloucher lives in your menu bar — close this window anytime, nudges keep working.", systemImage: "menubar.arrow.up.rectangle")
+                .font(.system(size: 11))
+                .foregroundStyle(.tertiary)
+                .padding(.top, 22)
+        }
+    }
+
+    private var permissions: some View {
+        VStack(spacing: 0) {
+            SetupStepsRow()
+
+            Text("Allow camera access")
+                .font(.system(size: 20, weight: .semibold))
+                .padding(.top, 18)
+
+            PermissionCard(
+                iconName: "camera.fill",
+                title: "Camera",
+                description: "Frames are analyzed on this Mac with Apple's Vision framework — never recorded, stored, or uploaded.",
+                state: cameraCardState,
+                primaryAction: cameraPrimaryAction,
+                settingsAction: appState.openCameraSettings
+            )
+            .frame(maxWidth: 470)
+            .padding(.top, 16)
+
+            Text("Next: calibrate your sit-tall posture.")
+                .font(.system(size: 11))
+                .foregroundStyle(.tertiary)
+                .padding(.top, 12)
+        }
     }
 
     private var cameraCardState: PermissionCardState {
@@ -1530,6 +1728,233 @@ private struct PermissionsSetupView: View {
             return appState.openCameraSettings
         default:
             return {}
+        }
+    }
+
+}
+
+private struct SetupStepsRow: View {
+    var currentStep = 1
+
+    var body: some View {
+        HStack(spacing: 10) {
+            SetupStep(number: 1, title: "Enable the camera", phase: phase(for: 1))
+            stepArrow
+            SetupStep(number: 2, title: "Calibrate sitting tall", phase: phase(for: 2))
+            stepArrow
+            SetupStep(number: 3, title: "Get gentle nudges", phase: phase(for: 3))
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Setup step \(currentStep) of 3: enable the camera, calibrate sitting tall, get gentle nudges.")
+    }
+
+    private func phase(for number: Int) -> SetupStep.Phase {
+        if number < currentStep {
+            .done
+        } else if number == currentStep {
+            .active
+        } else {
+            .upcoming
+        }
+    }
+
+    private var stepArrow: some View {
+        Image(systemName: "chevron.right")
+            .font(.system(size: 9, weight: .semibold))
+            .foregroundStyle(.tertiary)
+    }
+}
+
+private struct SetupStep: View {
+    enum Phase {
+        case done
+        case active
+        case upcoming
+    }
+
+    let number: Int
+    let title: String
+    let phase: Phase
+
+    var body: some View {
+        HStack(spacing: 6) {
+            ZStack {
+                Circle()
+                    .fill(circleFill)
+
+                if phase == .done {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(Color.white)
+                } else {
+                    Text("\(number)")
+                        .font(.system(size: 11, weight: .semibold, design: .rounded))
+                        .foregroundStyle(phase == .active ? Color.white : Color.secondary)
+                }
+            }
+            .frame(width: 18, height: 18)
+
+            Text(title)
+                .font(.system(size: 12, weight: phase == .active ? .medium : .regular))
+                .foregroundStyle(phase == .active ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
+                .fixedSize(horizontal: true, vertical: false)
+        }
+    }
+
+    private var circleFill: Color {
+        switch phase {
+        case .done:
+            InspectorColors.brand.opacity(0.85)
+        case .active:
+            InspectorColors.brand
+        case .upcoming:
+            Color.secondary.opacity(0.15)
+        }
+    }
+}
+
+// Animated hero for first launch: the figure slowly slouches at its desk,
+// receives a nudge pulse, and springs back upright — the product in one loop.
+private struct SlouchHeroView: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        Group {
+            if reduceMotion {
+                SlouchSceneCanvas(slouch: 1, pulse: 0)
+            } else {
+                TimelineView(.animation) { context in
+                    let phase = SlouchHeroView.phase(at: context.date.timeIntervalSinceReferenceDate)
+                    SlouchSceneCanvas(slouch: phase.slouch, pulse: phase.pulse)
+                }
+            }
+        }
+        .frame(width: 310, height: 210)
+        .accessibilityLabel("A figure at a desk slowly slouches, gets a gentle nudge, and sits back upright.")
+    }
+
+    // 8-second loop: slouch creeps in slowly, a nudge pulses, posture springs back.
+    static func phase(at time: TimeInterval) -> (slouch: CGFloat, pulse: CGFloat) {
+        let t = time.truncatingRemainder(dividingBy: 8)
+
+        let pulse: CGFloat
+        if t >= 4.5, t < 5.3 {
+            pulse = CGFloat((t - 4.5) / 0.8)
+        } else {
+            pulse = 0
+        }
+
+        let slouch: CGFloat
+        switch t {
+        case ..<4.5:
+            let u = CGFloat(t / 4.5)
+            slouch = u * u
+        case ..<5.0:
+            slouch = 1
+        case ..<5.7:
+            let v = CGFloat((t - 5.0) / 0.7)
+            slouch = 1 - easeOutBack(v)
+        default:
+            slouch = 0
+        }
+
+        return (slouch, pulse)
+    }
+
+    private static func easeOutBack(_ v: CGFloat) -> CGFloat {
+        let c1: CGFloat = 1.70158
+        let c3 = c1 + 1
+        let w = v - 1
+        return 1 + c3 * w * w * w + c1 * w * w
+    }
+}
+
+private struct SlouchSceneCanvas: View {
+    var slouch: CGFloat
+    var pulse: CGFloat
+
+    var body: some View {
+        Canvas { context, size in
+            // Geometry lives in the same 512x512, y-down design space as the
+            // brand SVGs and scripts/make_app_icon.swift.
+            let design = CGRect(x: 100, y: 96, width: 392, height: 392)
+            let scale = min(size.width / design.width, size.height / design.height)
+            let ox = (size.width - design.width * scale) / 2 - design.minX * scale
+            let oy = (size.height - design.height * scale) / 2 - design.minY * scale
+            let transform = CGAffineTransform(a: scale, b: 0, c: 0, d: scale, tx: ox, ty: oy)
+
+            let furniture = Color.secondary.opacity(0.5)
+            let figure = InspectorColors.brand
+
+            func fillRounded(_ x: CGFloat, _ y: CGFloat, _ w: CGFloat, _ h: CGFloat, _ r: CGFloat, _ color: Color) {
+                let path = Path(roundedRect: CGRect(x: x, y: y, width: w, height: h), cornerRadius: min(r, h / 2))
+                context.fill(path.applying(transform), with: .color(color))
+            }
+
+            func stroke(_ path: Path, width: CGFloat, _ color: Color) {
+                context.stroke(
+                    path.applying(transform),
+                    with: .color(color),
+                    style: StrokeStyle(lineWidth: width * scale, lineCap: .round, lineJoin: .round)
+                )
+            }
+
+            func point(_ upright: CGPoint, _ slouched: CGPoint) -> CGPoint {
+                CGPoint(
+                    x: upright.x + (slouched.x - upright.x) * slouch,
+                    y: upright.y + (slouched.y - upright.y) * slouch
+                )
+            }
+
+            // Chair: the straight backrest is the visual reference the spine deviates from.
+            fillRounded(116, 210, 16, 180, 8, furniture)
+            fillRounded(116, 378, 130, 16, 8, furniture)
+            fillRounded(124, 394, 13, 74, 6, furniture)
+            fillRounded(226, 394, 13, 74, 6, furniture)
+            // Desk: single offset leg with wide foot, top, keyboard.
+            fillRounded(398, 334, 15, 130, 7, furniture)
+            fillRounded(374, 462, 64, 10, 5, furniture)
+            fillRounded(300, 320, 176, 18, 9, furniture)
+            fillRounded(320, 310, 66, 10, 4, furniture)
+            // Monitor: screen, stand, base.
+            fillRounded(428, 190, 28, 112, 11, furniture)
+            fillRounded(437, 300, 10, 13, 0, furniture)
+            fillRounded(420, 311, 46, 9, 4.5, furniture)
+
+            // Legs stay planted while the back and head interpolate between poses.
+            var legs = Path()
+            legs.move(to: CGPoint(x: 180, y: 360))
+            legs.addLine(to: CGPoint(x: 286, y: 372))
+            legs.addLine(to: CGPoint(x: 294, y: 452))
+            stroke(legs, width: 42, figure)
+
+            var back = Path()
+            back.move(to: CGPoint(x: 180, y: 360))
+            back.addCurve(
+                to: point(CGPoint(x: 172, y: 212), CGPoint(x: 220, y: 236)),
+                control1: point(CGPoint(x: 174, y: 306), CGPoint(x: 160, y: 300)),
+                control2: point(CGPoint(x: 172, y: 254), CGPoint(x: 172, y: 248))
+            )
+            back.addCurve(
+                to: point(CGPoint(x: 182, y: 180), CGPoint(x: 300, y: 242)),
+                control1: point(CGPoint(x: 174, y: 200), CGPoint(x: 256, y: 226)),
+                control2: point(CGPoint(x: 178, y: 190), CGPoint(x: 282, y: 232))
+            )
+            stroke(back, width: 44, figure)
+
+            let headCenter = point(CGPoint(x: 188, y: 146), CGPoint(x: 314, y: 224))
+            let head = Path(ellipseIn: CGRect(x: headCenter.x - 42, y: headCenter.y - 42, width: 84, height: 84))
+            context.fill(head.applying(transform), with: .color(figure))
+
+            if pulse > 0, pulse < 1 {
+                let radius = 52 + 96 * pulse
+                let ring = Path(ellipseIn: CGRect(x: 314 - radius, y: 224 - radius, width: radius * 2, height: radius * 2))
+                context.stroke(
+                    ring.applying(transform),
+                    with: .color(figure.opacity(Double(1 - pulse) * 0.5)),
+                    style: StrokeStyle(lineWidth: 3 * scale)
+                )
+            }
         }
     }
 }
@@ -1592,7 +2017,8 @@ private struct PermissionCard: View {
             Button(buttonTitle) {
                 primaryAction()
             }
-            .controlSize(.small)
+            .buttonStyle(.borderedProminent)
+            .tint(InspectorColors.brand)
             .fixedSize(horizontal: true, vertical: false)
         case .requesting:
             VStack(alignment: .trailing, spacing: 4) {
@@ -1642,6 +2068,7 @@ private struct PermissionCard: View {
 }
 
 private enum InspectorColors {
+    static let brand = Color(red: 0.055, green: 0.624, blue: 0.557) // #0E9F8E
     static let good = Color(red: 0.114, green: 0.620, blue: 0.459)
     static let goodText = Color(red: 0.059, green: 0.431, blue: 0.337)
     static let slouch = Color(red: 0.847, green: 0.353, blue: 0.188)

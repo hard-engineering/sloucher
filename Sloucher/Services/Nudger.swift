@@ -13,6 +13,8 @@ final class Nudger: NSObject, UNUserNotificationCenterDelegate {
     private var lastNotificationDate: Date?
     private var notificationSequence = 0
     private var hasPlayedSoundForCurrentSlouch = false
+    private var testPreviewUntil: Date?
+    private var testPreviewClearWorkItem: DispatchWorkItem?
     private lazy var slouchSound: NSSound? = {
         let sound = NSSound(named: NSSound.Name("Glass")) ??
             NSSound(named: NSSound.Name("Ping")) ??
@@ -51,9 +53,28 @@ final class Nudger: NSObject, UNUserNotificationCenterDelegate {
         }
     }
 
+    func testNudge(
+        notificationsEnabled: Bool,
+        soundEnabled: Bool,
+        overlayEnabled: Bool,
+        notificationDelay: TimeInterval,
+        previewDuration: TimeInterval
+    ) {
+        performOnMain { [weak self] in
+            self?.applyTestNudge(
+                notificationsEnabled: notificationsEnabled,
+                soundEnabled: soundEnabled,
+                overlayEnabled: overlayEnabled,
+                notificationDelay: notificationDelay,
+                previewDuration: previewDuration
+            )
+        }
+    }
+
     func clear() {
         performOnMain { [weak self] in
             guard let self else { return }
+            cancelTestPreview()
             lastStatus = nil
             lastNotificationDate = nil
             hasPlayedSoundForCurrentSlouch = false
@@ -84,10 +105,13 @@ final class Nudger: NSObject, UNUserNotificationCenterDelegate {
             lastStatus = status
             lastNotificationDate = nil
             hasPlayedSoundForCurrentSlouch = false
+            // A manual Test nudge should remain visible even while normal tracking keeps reporting good posture.
+            guard !isTestPreviewActive else { return }
             overlayWindowController.hide()
             return
         }
 
+        cancelTestPreview()
         let now = Date()
         let isNewSlouch = lastStatus != .slouching
 
@@ -115,6 +139,65 @@ final class Nudger: NSObject, UNUserNotificationCenterDelegate {
         }
 
         lastStatus = status
+    }
+
+    private func applyTestNudge(
+        notificationsEnabled: Bool,
+        soundEnabled: Bool,
+        overlayEnabled: Bool,
+        notificationDelay: TimeInterval,
+        previewDuration: TimeInterval
+    ) {
+        let duration = max(0, previewDuration)
+        let previewUntil = Date().addingTimeInterval(duration)
+        testPreviewUntil = previewUntil
+        testPreviewClearWorkItem?.cancel()
+
+        notificationLog.info(
+            "test nudge preview started duration=\(duration, privacy: .public) notificationsEnabled=\(notificationsEnabled, privacy: .public) overlayEnabled=\(overlayEnabled, privacy: .public) soundEnabled=\(soundEnabled, privacy: .public)"
+        )
+
+        if overlayEnabled {
+            overlayWindowController.show()
+        } else if lastStatus != .slouching {
+            overlayWindowController.hide()
+        }
+
+        if notificationsEnabled {
+            sendSlouchNotification(delay: notificationDelay)
+        }
+
+        if soundEnabled {
+            playSlouchSound(force: true)
+        }
+
+        let work = DispatchWorkItem { [weak self] in
+            self?.clearTestPreview(expiringAt: previewUntil)
+        }
+        testPreviewClearWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration, execute: work)
+    }
+
+    private var isTestPreviewActive: Bool {
+        guard let testPreviewUntil else { return false }
+        return testPreviewUntil > Date()
+    }
+
+    private func cancelTestPreview() {
+        testPreviewClearWorkItem?.cancel()
+        testPreviewClearWorkItem = nil
+        testPreviewUntil = nil
+    }
+
+    private func clearTestPreview(expiringAt previewUntil: Date) {
+        guard testPreviewUntil == previewUntil else { return }
+
+        testPreviewClearWorkItem = nil
+        testPreviewUntil = nil
+        notificationLog.info("test nudge preview ended")
+
+        guard lastStatus != .slouching else { return }
+        overlayWindowController.hide()
     }
 
     private func shouldRenotify(now: Date, notificationsEnabled: Bool) -> Bool {
@@ -230,8 +313,8 @@ final class Nudger: NSObject, UNUserNotificationCenterDelegate {
         return String(describing: type(of: trigger))
     }
 
-    private func playSlouchSound() {
-        guard !hasPlayedSoundForCurrentSlouch else { return }
+    private func playSlouchSound(force: Bool = false) {
+        guard force || !hasPlayedSoundForCurrentSlouch else { return }
 
         guard let slouchSound else {
             NSSound.beep()
