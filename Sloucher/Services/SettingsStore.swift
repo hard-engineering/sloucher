@@ -17,6 +17,14 @@ final class SettingsStore: ObservableObject {
         didSet { defaults.set(overlayEnabled, forKey: Keys.overlayEnabled) }
     }
 
+    // On-failure padding rescue. Default on: it only runs when full-frame body
+    // pose fails, so enabling it cannot regress frames that already work. Exposed
+    // as a flag so it can be disabled without a rebuild if the live probe shows
+    // a problem.
+    @Published var paddingRescueEnabled: Bool {
+        didSet { defaults.set(paddingRescueEnabled, forKey: Keys.paddingRescueEnabled) }
+    }
+
     @Published var baseline: PostureBaseline? {
         didSet { persistBaseline() }
     }
@@ -30,6 +38,7 @@ final class SettingsStore: ObservableObject {
         self.notificationsEnabled = defaults.object(forKey: Keys.notificationsEnabled) as? Bool ?? true
         self.soundEnabled = defaults.object(forKey: Keys.soundEnabled) as? Bool ?? true
         self.overlayEnabled = defaults.object(forKey: Keys.overlayEnabled) as? Bool ?? true
+        self.paddingRescueEnabled = defaults.object(forKey: Keys.paddingRescueEnabled) as? Bool ?? true
         self.baseline = Self.loadBaseline(from: defaults)
         if self.baseline == nil {
             Self.clearPersistedBaseline(from: defaults)
@@ -37,7 +46,7 @@ final class SettingsStore: ObservableObject {
     }
 
     var decisionConfig: PostureDecisionConfig {
-        .from(sensitivity: sensitivity)
+        .from(sensitivity: sensitivity, paddingRescueEnabled: paddingRescueEnabled)
     }
 
     func clearBaseline() {
@@ -102,6 +111,7 @@ final class SettingsStore: ObservableObject {
         static let notificationsEnabled = "notificationsEnabled"
         static let soundEnabled = "soundEnabled"
         static let overlayEnabled = "overlayEnabled"
+        static let paddingRescueEnabled = "paddingRescueEnabled"
         static let baselineNeckDistance = "baseline.neckDistance"
         static let baselineShoulderWidth = "baseline.shoulderWidth"
         static let baselineFaceCenterY = "baseline.faceCenterY"

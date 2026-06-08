@@ -115,6 +115,10 @@ final class AppState: ObservableObject {
     private var calibrationBodyObservationTotal = 0
     private var calibrationValidBodyCandidateTotal = 0
     private var calibrationFaceDetectedFrames = 0
+    // Live-probe counters: how often the on-failure padding retry recovered a
+    // frame that full-frame Vision missed, during calibration vs tracking.
+    private var calibrationPaddingRescueCount = 0
+    private var trackingPaddingRescueCount = 0
     private var calibrationDebugOrientationSweeps: [PostureOrientationSweepDiagnostics] = []
     private var trackingDebugFrames: [PostureTrackingFrameDiagnostics] = []
     private var trackingDebugFrameNumber = 0
@@ -355,6 +359,7 @@ final class AppState: ObservableObject {
             calibrationBodyObservationTotal = 0
             calibrationValidBodyCandidateTotal = 0
             calibrationFaceDetectedFrames = 0
+            calibrationPaddingRescueCount = 0
             calibrationDebugOrientationSweeps = []
             postureAnalyzer.resetCalibrationDebugDiagnostics()
             resetTrackingDebugDiagnostics()
@@ -929,6 +934,7 @@ final class AppState: ObservableObject {
             )
             let frameDiagnostics = self.postureAnalyzer.lastFrameDiagnostics
             self.publishFrameDiagnostics(frameDiagnostics, result: result)
+            self.recordPaddingRescueDiagnostics(frameDiagnostics, isCalibration: isCalibrating)
             self.publishPixelBufferDiagnostics(pixelBufferDiagnostics)
             self.publishFrameIdentityDiagnostics(frameIdentityDiagnostics)
             if collectTrackingDiagnostics, let pixelBufferDiagnostics {
@@ -1544,6 +1550,27 @@ final class AppState: ObservableObject {
         )
     }
 
+    // Counts how often the on-failure padding retry rescued a frame full-frame
+    // Vision missed, and records the rescued shoulder width so the live rescue
+    // rate and its scale fidelity can be read straight from UserDefaults.
+    private func recordPaddingRescueDiagnostics(
+        _ diagnostics: PostureFrameDiagnostics,
+        isCalibration: Bool
+    ) {
+        guard diagnostics.bodyRescuedByPadding else { return }
+
+        if isCalibration {
+            calibrationPaddingRescueCount += 1
+            runtimeDefaults.set(calibrationPaddingRescueCount, forKey: RuntimeKeys.calibrationPaddingRescueCount)
+        } else {
+            trackingPaddingRescueCount += 1
+            runtimeDefaults.set(trackingPaddingRescueCount, forKey: RuntimeKeys.trackingPaddingRescueCount)
+        }
+
+        setRuntime(diagnostics.candidateShoulderWidth, forKey: RuntimeKeys.paddingRescueLastShoulderWidth)
+        setRuntime(diagnostics.rescuePadFactor, forKey: RuntimeKeys.paddingRescueFactor)
+    }
+
     private func recordTrackingDiagnostics(
         _ diagnostics: PostureFrameDiagnostics,
         result: PostureAnalysisResult,
@@ -1666,6 +1693,7 @@ final class AppState: ObservableObject {
     private func resetTrackingDebugDiagnostics() {
         trackingDebugFrames = []
         trackingDebugFrameNumber = 0
+        trackingPaddingRescueCount = 0
         trackingDebugOrientationSweeps = []
         lastValidForensicFrame = nil
         pendingForensicCollapse = nil
@@ -2353,6 +2381,10 @@ final class AppState: ObservableObject {
         static let calibrationLastCandidateNeckDistance = "runtime.calibration.lastCandidate.neckDistance"
         static let calibrationLastCandidateScore = "runtime.calibration.lastCandidate.score"
         static let calibrationHeadAnchorSource = "runtime.calibration.headAnchorSource"
+        static let calibrationPaddingRescueCount = "runtime.calibration.paddingRescue.count"
+        static let trackingPaddingRescueCount = "runtime.tracking.paddingRescue.count"
+        static let paddingRescueLastShoulderWidth = "runtime.paddingRescue.lastShoulderWidth"
+        static let paddingRescueFactor = "runtime.paddingRescue.factor"
         static let calibrationSeedCandidates = "runtime.calibration.seedCandidates"
         static let calibrationSeedAccepted = "runtime.calibration.seedAccepted"
         static let calibrationBodyObservationTotal = "runtime.calibration.bodyObservationTotal"

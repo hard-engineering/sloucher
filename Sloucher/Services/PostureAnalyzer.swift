@@ -1,4 +1,5 @@
 import AVFoundation
+import CoreVideo
 import Foundation
 import Vision
 
@@ -31,6 +32,24 @@ final class PostureAnalyzer {
         case calibration
         case tracking
     }
+
+    // Coordinate-agnostic joint sample. The full-frame path adapts Vision's
+    // VNRecognizedPoint into this; the padding-rescue path injects points whose
+    // coordinates have been remapped from the padded buffer back to the original
+    // frame. Letting every candidate helper work on JointPoint keeps a single
+    // gate/scoring implementation for both paths.
+    private struct JointPoint {
+        let location: CGPoint
+        let confidence: VNConfidence
+    }
+
+    private typealias JointPoints = [VNHumanBodyPoseObservation.JointName: JointPoint]
+
+    // Taller-canvas pad factor for the on-failure rescue: the real frame occupies
+    // the top 1/1.6 of the buffer, gray fills the rest. Chosen from offline
+    // replay of captured failures (rescue plateaued ~1.3-2.0; 1.6 had the best
+    // metric fidelity). Inverse map: original_y = 1.6*padded_y - 0.6.
+    private let paddingRescueFactor: Double = 1.6
 
     private enum MetricExtractionResult {
         case success(PostureMetrics, PoseFrame?)
@@ -106,7 +125,8 @@ final class PostureAnalyzer {
             from: sampleBuffer,
             now: now,
             collectCalibrationDiagnostics: collectCalibrationDiagnostics,
-            collectTrackingDiagnostics: collectTrackingDiagnostics
+            collectTrackingDiagnostics: collectTrackingDiagnostics,
+            paddingRescueEnabled: config.paddingRescueEnabled
         ) {
         case .success(let metrics, let pose):
             unreliableSince = nil
@@ -166,7 +186,8 @@ final class PostureAnalyzer {
         from sampleBuffer: CMSampleBuffer,
         now: Date,
         collectCalibrationDiagnostics: Bool,
-        collectTrackingDiagnostics: Bool
+        collectTrackingDiagnostics: Bool,
+        paddingRescueEnabled: Bool
     ) -> MetricExtractionResult {
         let bodyRequest = VNDetectHumanBodyPoseRequest()
         let faceRequest = VNDetectFaceRectanglesRequest()
@@ -202,8 +223,174 @@ final class PostureAnalyzer {
                 collectOrientationSweepIfNeeded(from: sampleBuffer, mode: .tracking)
             }
 
+            // Full-frame body pose missed the user but a face is visible. This is
+            // the laptop "large head, shoulders near the frame edge" framing the
+            // full-body pose model handles worst (offline evidence: ~80% of such
+            // failures still contain the user). Retry once on a zoomed-out padded
+            // buffer that reframes the user like a mid-distance person. On-failure
+            // only, so frames that already succeed are never touched.
+            if paddingRescueEnabled, let faceSignal,
+               case .success(let metrics, let pose) = paddingRescue(
+                   sampleBuffer: sampleBuffer,
+                   faceSignal: faceSignal,
+                   now: now
+               ) {
+                return .success(metrics, pose)
+            }
+
             return .failure(bodyReason, facePose)
         }
+    }
+
+    // MARK: - On-failure padding rescue
+
+    private func paddingRescue(
+        sampleBuffer: CMSampleBuffer,
+        faceSignal: FaceSignal,
+        now: Date
+    ) -> MetricExtractionResult {
+        guard let padded = Self.makePaddedBuffer(from: sampleBuffer, factor: paddingRescueFactor) else {
+            return .failure("Padding retry unavailable.", nil)
+        }
+
+        let request = VNDetectHumanBodyPoseRequest()
+        let handler = VNImageRequestHandler(cvPixelBuffer: padded, orientation: .up, options: [:])
+        do {
+            try handler.perform([request])
+        } catch {
+            return .failure("Padding retry failed: \(error.localizedDescription)", nil)
+        }
+
+        guard let observations = request.results, !observations.isEmpty else {
+            return .failure("Padding retry found no body.", nil)
+        }
+
+        // Run every padded observation through the same candidate gate and scoring
+        // as the full-frame path, after mapping its coordinates back to the
+        // original frame. The existing face signal (already in original coords) is
+        // reused so face-match scoring still rejects background people.
+        var candidates: [BodyCandidate] = []
+        for observation in observations {
+            guard let rawPoints = try? observation.recognizedPoints(.all) else { continue }
+            let points = remapPaddedPoints(rawPoints, factor: paddingRescueFactor)
+            switch makeBodyCandidate(from: points, faceSignal: faceSignal, now: now) {
+            case .success(let metrics, let pose):
+                let resolved = pose ?? makePosePlaceholder(metrics: metrics, now: now)
+                candidates.append(
+                    BodyCandidate(
+                        metrics: metrics,
+                        pose: resolved,
+                        score: bodyScore(metrics: metrics, pose: resolved, faceSignal: faceSignal),
+                        headAnchorSource: resolved.nose == resolved.faceCenter ? "face" : "body"
+                    )
+                )
+            case .failure:
+                continue
+            }
+        }
+
+        guard let best = candidates.max(by: { $0.score < $1.score }) else {
+            return .failure("Padding retry candidate rejected.", nil)
+        }
+
+        // Mark this as a normal valid frame for the decision logic, and record the
+        // rescue so the runtime probe can measure how often padding saved a frame
+        // and at what shoulder-width scale (to confirm it matches the baseline).
+        lastFrameDiagnostics.bodyFailureReason = nil
+        lastFrameDiagnostics.bodyRescuedByPadding = true
+        lastFrameDiagnostics.rescuePadFactor = paddingRescueFactor
+        lastFrameDiagnostics.validBodyCandidateCount = candidates.count
+        lastFrameDiagnostics.headAnchorSource = best.headAnchorSource
+        lastFrameDiagnostics.bestCandidateScore = best.score
+        lastFrameDiagnostics.candidateConfidence = Double(best.metrics.confidence)
+        lastFrameDiagnostics.candidateShoulderWidth = best.metrics.shoulderWidth
+        lastFrameDiagnostics.candidateNeckDistance = best.metrics.neckDistance
+        return .success(best.metrics, best.pose)
+    }
+
+    private func remapPaddedPoints(
+        _ points: [VNHumanBodyPoseObservation.JointName: VNRecognizedPoint],
+        factor: Double
+    ) -> JointPoints {
+        // The padded buffer placed the real frame in the top 1/factor of a taller
+        // canvas, so a detection at padded-y maps back to original-y by
+        // original_y = factor*padded_y - (factor - 1). x is unchanged because the
+        // pad only grows height. Points that fall in the gray pad map below 0 and
+        // are rejected by the normal geometry gates.
+        points.mapValues { point in
+            let mappedY = factor * Double(point.location.y) - (factor - 1)
+            return JointPoint(
+                location: CGPoint(x: point.location.x, y: CGFloat(mappedY)),
+                confidence: point.confidence
+            )
+        }
+    }
+
+    private static func jointPoints(
+        from points: [VNHumanBodyPoseObservation.JointName: VNRecognizedPoint]
+    ) -> JointPoints {
+        points.mapValues { JointPoint(location: $0.location, confidence: $0.confidence) }
+    }
+
+    // Build a taller 420f buffer with the source frame copied to the top and the
+    // extra rows filled with neutral gray (luma/chroma 128). Lossless byte copy of
+    // the camera planes; returns nil if the format is ever not bi-planar 420f.
+    private static func makePaddedBuffer(from sampleBuffer: CMSampleBuffer, factor: Double) -> CVPixelBuffer? {
+        guard let source = CMSampleBufferGetImageBuffer(sampleBuffer) else { return nil }
+        guard CVPixelBufferGetPixelFormatType(source) == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+              CVPixelBufferGetPlaneCount(source) == 2 else {
+            return nil
+        }
+
+        let width = CVPixelBufferGetWidth(source)
+        let height = CVPixelBufferGetHeight(source)
+        var paddedHeight = Int(Double(height) * factor)
+        if paddedHeight % 2 == 1 { paddedHeight += 1 } // chroma plane is half-height
+
+        var pixelBuffer: CVPixelBuffer?
+        let attributes: [String: Any] = [kCVPixelBufferIOSurfacePropertiesKey as String: [:]]
+        guard CVPixelBufferCreate(
+            kCFAllocatorDefault, width, paddedHeight,
+            kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+            attributes as CFDictionary, &pixelBuffer
+        ) == kCVReturnSuccess, let destination = pixelBuffer else {
+            return nil
+        }
+
+        CVPixelBufferLockBaseAddress(source, .readOnly)
+        CVPixelBufferLockBaseAddress(destination, [])
+        defer {
+            CVPixelBufferUnlockBaseAddress(source, .readOnly)
+            CVPixelBufferUnlockBaseAddress(destination, [])
+        }
+
+        for plane in 0..<2 {
+            guard let sourceBase = CVPixelBufferGetBaseAddressOfPlane(source, plane),
+                  let destBase = CVPixelBufferGetBaseAddressOfPlane(destination, plane) else {
+                return nil
+            }
+            let sourceBytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(source, plane)
+            let destBytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(destination, plane)
+            let copyBytes = min(sourceBytesPerRow, destBytesPerRow)
+            let sourceRows = CVPixelBufferGetHeightOfPlane(source, plane)
+            let destRows = CVPixelBufferGetHeightOfPlane(destination, plane)
+            let sourceBytes = sourceBase.assumingMemoryBound(to: UInt8.self)
+            let destBytes = destBase.assumingMemoryBound(to: UInt8.self)
+
+            for row in 0..<destRows {
+                if row < sourceRows {
+                    memcpy(
+                        destBytes.advanced(by: row * destBytesPerRow),
+                        sourceBytes.advanced(by: row * sourceBytesPerRow),
+                        copyBytes
+                    )
+                } else {
+                    memset(destBytes.advanced(by: row * destBytesPerRow), 128, destBytesPerRow)
+                }
+            }
+        }
+
+        return destination
     }
 
     private func makeBodyMetrics(
@@ -224,7 +411,7 @@ final class PostureAnalyzer {
 
         for observation in observations {
             do {
-                let points = try observation.recognizedPoints(.all)
+                let points = Self.jointPoints(from: try observation.recognizedPoints(.all))
                 switch makeBodyCandidate(from: points, faceSignal: faceSignal, now: now) {
                 case .success(let metrics, let pose):
                     recordRawBodyProbe(rawBodyProbe(from: points, rejectReason: nil))
@@ -293,7 +480,7 @@ final class PostureAnalyzer {
     }
 
     private func makeBodyCandidate(
-        from points: [VNHumanBodyPoseObservation.JointName: VNRecognizedPoint],
+        from points: JointPoints,
         faceSignal: FaceSignal?,
         now: Date
     ) -> MetricExtractionResult {
@@ -360,7 +547,7 @@ final class PostureAnalyzer {
     }
 
     private func rawBodyProbe(
-        from points: [VNHumanBodyPoseObservation.JointName: VNRecognizedPoint],
+        from points: JointPoints,
         rejectReason: String?
     ) -> RawBodyProbe {
         let nose = rawPoint(.nose, in: points)
@@ -406,7 +593,7 @@ final class PostureAnalyzer {
     }
 
     private func bodyObservationDiagnostics(
-        from points: [VNHumanBodyPoseObservation.JointName: VNRecognizedPoint],
+        from points: JointPoints,
         validCandidate: Bool,
         rejectReason: String?,
         faceSignal: FaceSignal? = nil
@@ -447,7 +634,7 @@ final class PostureAnalyzer {
     }
 
     private func diagnosticHeadPoint(
-        in points: [VNHumanBodyPoseObservation.JointName: VNRecognizedPoint]
+        in points: JointPoints
     ) -> CGPoint? {
         if let nose = rawPoint(.nose, in: points) {
             return nose.location
@@ -472,7 +659,7 @@ final class PostureAnalyzer {
     }
 
     private func diagnosticShoulderMidPoint(
-        in points: [VNHumanBodyPoseObservation.JointName: VNRecognizedPoint]
+        in points: JointPoints
     ) -> CGPoint? {
         guard
             let leftShoulder = rawPoint(.leftShoulder, in: points),
@@ -613,9 +800,9 @@ final class PostureAnalyzer {
     }
 
     private func headAnchorY(
-        nose: VNRecognizedPoint?,
-        leftEye: VNRecognizedPoint?,
-        rightEye: VNRecognizedPoint?,
+        nose: JointPoint?,
+        leftEye: JointPoint?,
+        rightEye: JointPoint?,
         faceSignal: FaceSignal?
     ) -> CGFloat {
         guard let nose else {
@@ -679,8 +866,8 @@ final class PostureAnalyzer {
 
     private func reliablePoint(
         _ joint: VNHumanBodyPoseObservation.JointName,
-        in points: [VNHumanBodyPoseObservation.JointName: VNRecognizedPoint]
-    ) -> VNRecognizedPoint? {
+        in points: JointPoints
+    ) -> JointPoint? {
         guard let point = points[joint], point.confidence >= minimumJointConfidence else {
             return nil
         }
@@ -694,8 +881,8 @@ final class PostureAnalyzer {
 
     private func optionalPoint(
         _ joint: VNHumanBodyPoseObservation.JointName,
-        in points: [VNHumanBodyPoseObservation.JointName: VNRecognizedPoint]
-    ) -> VNRecognizedPoint? {
+        in points: JointPoints
+    ) -> JointPoint? {
         guard let point = points[joint], point.confidence >= minimumJointConfidence else {
             return nil
         }
@@ -709,8 +896,8 @@ final class PostureAnalyzer {
 
     private func rawPoint(
         _ joint: VNHumanBodyPoseObservation.JointName,
-        in points: [VNHumanBodyPoseObservation.JointName: VNRecognizedPoint]
-    ) -> VNRecognizedPoint? {
+        in points: JointPoints
+    ) -> JointPoint? {
         guard let point = points[joint] else {
             return nil
         }
@@ -842,7 +1029,7 @@ final class PostureAnalyzer {
 
         for observation in observations {
             do {
-                let points = try observation.recognizedPoints(.all)
+                let points = Self.jointPoints(from: try observation.recognizedPoints(.all))
                 let probe: RawBodyProbe
                 let validCandidate: Bool
                 let rejectReason: String?

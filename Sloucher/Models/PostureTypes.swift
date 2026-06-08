@@ -198,6 +198,11 @@ struct PostureFrameDiagnostics: Equatable {
     var motionGateFrameHash: String?
     var consecutiveFailureFrameCount: Int = 0
     var forcedVisionAttemptsSinceFailure: Int = 0
+    // Set when full-frame body pose missed the user but a zoomed-out (padded)
+    // retry recovered them. Lets the runtime probe measure how often the
+    // on-failure padding rescue fires and at what scale.
+    var bodyRescuedByPadding: Bool = false
+    var rescuePadFactor: Double?
     var orientationRetryBestOrientation: String?
     var orientationRetryBestValidCandidateCount: Int?
     var orientationRetryUpMirroredValidCandidateCount: Int?
@@ -373,14 +378,22 @@ struct PostureDecisionConfig: Equatable {
     let holdSeconds: TimeInterval
     let recoverSeconds: TimeInterval
     let unreliableSeconds: TimeInterval
+    // When true, a frame whose full-frame body pose failed (while a face is
+    // visible) is retried on a zoomed-out padded buffer before being treated as
+    // unreliable. On-failure only, so working frames are untouched.
+    let paddingRescueEnabled: Bool
 
-    static func from(sensitivity: Sensitivity) -> PostureDecisionConfig {
+    static func from(
+        sensitivity: Sensitivity,
+        paddingRescueEnabled: Bool = true
+    ) -> PostureDecisionConfig {
         return PostureDecisionConfig(
             dropThreshold: sensitivity.dropThreshold,
             closenessThreshold: 1.18,
             holdSeconds: 5,
             recoverSeconds: 3,
-            unreliableSeconds: 8
+            unreliableSeconds: 8,
+            paddingRescueEnabled: paddingRescueEnabled
         )
     }
 }
