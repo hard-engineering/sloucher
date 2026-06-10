@@ -27,6 +27,13 @@ final class PostureAnalyzer {
     private var trackingOrientationSweepCount = 0
     private var consecutiveFailureFrameCount = 0
     private var forcedVisionAttemptsSinceFailure = 0
+    // Short rolling buffers (≈1s of accepted frames) for median-smoothing the two
+    // body measurements the decision depends on. The padded detector's shoulder
+    // width can swing ±17% across head poses; smoothing keeps a single wide frame
+    // from tripping the lean threshold and faking a head-drop at once.
+    private var recentShoulderWidths: [Double] = []
+    private var recentVerticalGaps: [Double] = []
+    private let metricSmoothingSampleCount = 15
 
     private enum OrientationSweepMode {
         case calibration
@@ -128,7 +135,10 @@ final class PostureAnalyzer {
             collectTrackingDiagnostics: collectTrackingDiagnostics,
             paddingRescueEnabled: config.paddingRescueEnabled
         ) {
-        case .success(let metrics, let pose):
+        case .success(let rawMetrics, let pose):
+            // Smooth shoulder width and the head-shoulder gap before they reach the
+            // decision; the pose overlay still gets the raw points.
+            let metrics = smoothedMetrics(from: rawMetrics)
             unreliableSince = nil
             lastReliableMetrics = metrics
             lastReliablePose = pose
@@ -162,6 +172,9 @@ final class PostureAnalyzer {
 
     func resetCalibrationDebugDiagnostics() {
         calibrationOrientationSweepCount = 0
+        // Start calibration with a clean smoothing window so pre-calibration
+        // tracking values don't leak into the baseline samples.
+        resetMetricSmoothing()
     }
 
     func resetTrackingDebugDiagnostics() {
@@ -189,18 +202,16 @@ final class PostureAnalyzer {
         collectTrackingDiagnostics: Bool,
         paddingRescueEnabled: Bool
     ) -> MetricExtractionResult {
-        let bodyRequest = VNDetectHumanBodyPoseRequest()
+        // Face detection on the original frame. We always need the face: it is how
+        // the padded body path tells the user from background people, the head
+        // anchor, and the face baseline. Body pose is handled separately below so
+        // we never run it full-frame when the padded path already found the user.
+        // The capture output is intentionally unmirrored; preview mirroring is
+        // UI-only. Passing .up keeps Vision's coordinates tied to the camera buffer.
         let faceRequest = VNDetectFaceRectanglesRequest()
         let faceLandmarksRequest = VNDetectFaceLandmarksRequest()
-        // The capture output is intentionally unmirrored; preview mirroring is UI-only.
-        // Passing .up keeps Vision's coordinates tied to the native camera buffer.
-        let handler = VNImageRequestHandler(cmSampleBuffer: sampleBuffer, orientation: .up, options: [:])
-
-        do {
-            try handler.perform([bodyRequest, faceRequest, faceLandmarksRequest])
-        } catch {
-            return .failure("Vision failed: \(error.localizedDescription)", nil)
-        }
+        let faceHandler = VNImageRequestHandler(cmSampleBuffer: sampleBuffer, orientation: .up, options: [:])
+        try? faceHandler.perform([faceRequest, faceLandmarksRequest])
 
         let faceSignal = bestFaceSignal(
             rectanglesRequest: faceRequest,
@@ -213,38 +224,54 @@ final class PostureAnalyzer {
         lastFrameDiagnostics.faceConfidence = faceSignal.map { Double($0.confidence) }
         let facePose = faceSignal.map { makeFacePose(from: $0, now: now) }
 
+        // Primary path: padded body pose. In the laptop "large head, shoulders at
+        // the frame edge" framing, full-frame body pose fails ~92% of the time, so
+        // trying it first wastes an inference on nearly every frame. Padding
+        // reframes the user like a mid-distance person and detects ~98% of those.
+        // It needs the face for candidate scoring, so only when a face is present.
+        if paddingRescueEnabled, let faceSignal,
+           case .success(let metrics, let pose) = detectBodyWithPadding(
+               sampleBuffer: sampleBuffer,
+               faceSignal: faceSignal,
+               now: now
+           ) {
+            return .success(metrics, pose)
+        }
+
+        // Fallback (and the path when padding is disabled or no face is present):
+        // full-frame body pose on the original buffer. Recovers the minority of
+        // frames where full-frame succeeds but padding does not.
+        let bodyRequest = VNDetectHumanBodyPoseRequest()
+        let bodyHandler = VNImageRequestHandler(cmSampleBuffer: sampleBuffer, orientation: .up, options: [:])
+        do {
+            try bodyHandler.perform([bodyRequest])
+        } catch {
+            return .failure("Vision failed: \(error.localizedDescription)", facePose)
+        }
+
         switch makeBodyMetrics(from: bodyRequest, faceSignal: faceSignal, now: now) {
         case .success(let metrics, let pose):
+            lastFrameDiagnostics.fullFrameSucceeded = true
             return .success(metrics, pose)
         case .failure(let bodyReason, _):
+            // Both detectors failed this frame.
+            lastFrameDiagnostics.fullFrameBodyFailed = true
+
+            // Gather debug orientation-sweep evidence only when nothing detected
+            // the body (capped per episode in debug builds).
             if collectCalibrationDiagnostics, faceSignal != nil {
                 collectOrientationSweepIfNeeded(from: sampleBuffer, mode: .calibration)
             } else if collectTrackingDiagnostics, faceSignal != nil {
                 collectOrientationSweepIfNeeded(from: sampleBuffer, mode: .tracking)
             }
 
-            // Full-frame body pose missed the user but a face is visible. This is
-            // the laptop "large head, shoulders near the frame edge" framing the
-            // full-body pose model handles worst (offline evidence: ~80% of such
-            // failures still contain the user). Retry once on a zoomed-out padded
-            // buffer that reframes the user like a mid-distance person. On-failure
-            // only, so frames that already succeed are never touched.
-            if paddingRescueEnabled, let faceSignal,
-               case .success(let metrics, let pose) = paddingRescue(
-                   sampleBuffer: sampleBuffer,
-                   faceSignal: faceSignal,
-                   now: now
-               ) {
-                return .success(metrics, pose)
-            }
-
             return .failure(bodyReason, facePose)
         }
     }
 
-    // MARK: - On-failure padding rescue
+    // MARK: - Padded (primary) body detection
 
-    private func paddingRescue(
+    private func detectBodyWithPadding(
         sampleBuffer: CMSampleBuffer,
         faceSignal: FaceSignal,
         now: Date
@@ -294,10 +321,11 @@ final class PostureAnalyzer {
         }
 
         // Mark this as a normal valid frame for the decision logic, and record the
-        // rescue so the runtime probe can measure how often padding saved a frame
-        // and at what shoulder-width scale (to confirm it matches the baseline).
+        // detection so the runtime probe can measure how often padding is the
+        // detector and at what shoulder-width scale (to confirm it matches the
+        // baseline, which must be calibrated in the same padded scale).
         lastFrameDiagnostics.bodyFailureReason = nil
-        lastFrameDiagnostics.bodyRescuedByPadding = true
+        lastFrameDiagnostics.detectedByPadding = true
         lastFrameDiagnostics.rescuePadFactor = paddingRescueFactor
         lastFrameDiagnostics.validBodyCandidateCount = candidates.count
         lastFrameDiagnostics.headAnchorSource = best.headAnchorSource
@@ -1280,7 +1308,70 @@ final class PostureAnalyzer {
         // A new baseline/run should collect fresh live failure evidence instead
         // of keeping an old sweep-limit count.
         trackingOrientationSweepCount = 0
+        // A new baseline changes the scale; flush smoothing so old-scale widths
+        // don't bias the first second of the new run.
+        resetMetricSmoothing()
         motionGate.reset()
+    }
+
+    // Median-smooth shoulder width and the head-to-shoulder gap over a short
+    // window, then recompute neck distance and closeness from the smoothed parts.
+    // Median (not mean) is used because the failure mode is occasional wide
+    // outlier frames, which a mean would still be dragged by. Smoothing the
+    // denominator also stops a single small-width frame from spiking the ratio.
+    // Only body metrics are smoothed; face metrics pass through unchanged.
+    private func smoothedMetrics(from metrics: PostureMetrics) -> PostureMetrics {
+        guard metrics.source == .body, metrics.shoulderWidth.isFinite, metrics.shoulderWidth > 0 else {
+            return metrics
+        }
+
+        // Recover the vertical gap from the ratio so we can smooth numerator and
+        // denominator independently (neckDistance = gap / shoulderWidth).
+        let verticalGap = metrics.neckDistance * metrics.shoulderWidth
+        recentShoulderWidths.append(metrics.shoulderWidth)
+        recentVerticalGaps.append(verticalGap)
+        if recentShoulderWidths.count > metricSmoothingSampleCount {
+            recentShoulderWidths.removeFirst(recentShoulderWidths.count - metricSmoothingSampleCount)
+            recentVerticalGaps.removeFirst(recentVerticalGaps.count - metricSmoothingSampleCount)
+        }
+
+        let smoothedShoulderWidth = median(recentShoulderWidths)
+        let smoothedGap = median(recentVerticalGaps)
+        guard smoothedShoulderWidth > 0 else { return metrics }
+
+        let smoothedCloseness: Double
+        if let baseline, baseline.hasBodyBaseline {
+            smoothedCloseness = smoothedShoulderWidth / baseline.shoulderWidth
+        } else {
+            smoothedCloseness = metrics.closeness
+        }
+
+        return PostureMetrics(
+            source: metrics.source,
+            neckDistance: smoothedGap / smoothedShoulderWidth,
+            shoulderWidth: smoothedShoulderWidth,
+            closeness: smoothedCloseness,
+            shoulderTiltDegrees: metrics.shoulderTiltDegrees,
+            faceCenterY: metrics.faceCenterY,
+            faceWidth: metrics.faceWidth,
+            confidence: metrics.confidence,
+            timestamp: metrics.timestamp
+        )
+    }
+
+    private func resetMetricSmoothing() {
+        recentShoulderWidths = []
+        recentVerticalGaps = []
+    }
+
+    private func median(_ values: [Double]) -> Double {
+        guard !values.isEmpty else { return 0 }
+        let sorted = values.sorted()
+        let mid = sorted.count / 2
+        if sorted.count.isMultiple(of: 2) {
+            return (sorted[mid - 1] + sorted[mid]) / 2
+        }
+        return sorted[mid]
     }
 
     private func distance(_ first: CGPoint, _ second: CGPoint) -> Double {

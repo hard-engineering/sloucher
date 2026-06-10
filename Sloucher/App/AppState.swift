@@ -115,10 +115,23 @@ final class AppState: ObservableObject {
     private var calibrationBodyObservationTotal = 0
     private var calibrationValidBodyCandidateTotal = 0
     private var calibrationFaceDetectedFrames = 0
-    // Live-probe counters: how often the on-failure padding retry recovered a
-    // frame that full-frame Vision missed, during calibration vs tracking.
-    private var calibrationPaddingRescueCount = 0
-    private var trackingPaddingRescueCount = 0
+    // Per-session frame accounting for the live probe. A session spans from the
+    // last tracking-diagnostics reset (calibration start) to now. All mutated on
+    // the analysis queue except sessionFramesDropped, which is bumped on the
+    // capture queue under frameGate.
+    private var sessionStartedAt: Date?
+    private var sessionFramesProcessed = 0
+    private var sessionFramesDropped = 0
+    private var sessionFramesVisionRan = 0
+    private var sessionFramesDetectedByPadding = 0
+    private var sessionFramesDetectedByFullFrame = 0
+    private var sessionFramesUndetected = 0
+    private var sessionDetectionShoulderWidths: [Double] = []
+    // Backpressure: only one frame is analyzed at a time. Frames that arrive while
+    // the analyzer is busy are dropped, not queued, so a slow frame (e.g. the
+    // padding retry) cannot accumulate an unbounded backlog and minutes of lag.
+    private let frameGate = NSLock()
+    private var isAnalyzingFrame = false
     private var calibrationDebugOrientationSweeps: [PostureOrientationSweepDiagnostics] = []
     private var trackingDebugFrames: [PostureTrackingFrameDiagnostics] = []
     private var trackingDebugFrameNumber = 0
@@ -359,7 +372,6 @@ final class AppState: ObservableObject {
             calibrationBodyObservationTotal = 0
             calibrationValidBodyCandidateTotal = 0
             calibrationFaceDetectedFrames = 0
-            calibrationPaddingRescueCount = 0
             calibrationDebugOrientationSweeps = []
             postureAnalyzer.resetCalibrationDebugDiagnostics()
             resetTrackingDebugDiagnostics()
@@ -917,8 +929,26 @@ final class AppState: ObservableObject {
     }
 
     private func processFrame(_ sampleBuffer: CMSampleBuffer) {
+        // Backpressure: if the analyzer is still working on the previous frame,
+        // drop this one rather than queueing it. analysisQueue.async with no gate
+        // lets any per-frame slowdown accumulate an unbounded backlog (seconds to
+        // minutes of latency). Dropping keeps the analyzer on a recent frame.
+        frameGate.lock()
+        if isAnalyzingFrame {
+            sessionFramesDropped += 1
+            frameGate.unlock()
+            return
+        }
+        isAnalyzingFrame = true
+        frameGate.unlock()
+
         analysisQueue.async { [weak self] in
             guard let self else { return }
+            defer {
+                self.frameGate.lock()
+                self.isAnalyzingFrame = false
+                self.frameGate.unlock()
+            }
             let isCalibrating = self.calibrator.isCollecting
             let collectTrackingDiagnostics = !isCalibrating && self.hasBaseline
             let forceInference = isCalibrating || self.inspectorVisible
@@ -934,7 +964,7 @@ final class AppState: ObservableObject {
             )
             let frameDiagnostics = self.postureAnalyzer.lastFrameDiagnostics
             self.publishFrameDiagnostics(frameDiagnostics, result: result)
-            self.recordPaddingRescueDiagnostics(frameDiagnostics, isCalibration: isCalibrating)
+            self.recordSessionFrameStats(frameDiagnostics)
             self.publishPixelBufferDiagnostics(pixelBufferDiagnostics)
             self.publishFrameIdentityDiagnostics(frameIdentityDiagnostics)
             if collectTrackingDiagnostics, let pixelBufferDiagnostics {
@@ -1550,25 +1580,80 @@ final class AppState: ObservableObject {
         )
     }
 
-    // Counts how often the on-failure padding retry rescued a frame full-frame
-    // Vision missed, and records the rescued shoulder width so the live rescue
-    // rate and its scale fidelity can be read straight from UserDefaults.
-    private func recordPaddingRescueDiagnostics(
-        _ diagnostics: PostureFrameDiagnostics,
-        isCalibration: Bool
-    ) {
-        guard diagnostics.bodyRescuedByPadding else { return }
+    // Per-session frame accounting + detection-source probe. Called once per
+    // analyzed frame on the analysis queue. Padding is the primary detector;
+    // "detectedByFullFrame" is the value of keeping the full-frame fallback.
+    private func recordSessionFrameStats(_ diagnostics: PostureFrameDiagnostics) {
+        if sessionStartedAt == nil { sessionStartedAt = Date() }
+        sessionFramesProcessed += 1
+        if !diagnostics.motionGateSkipped { sessionFramesVisionRan += 1 }
 
-        if isCalibration {
-            calibrationPaddingRescueCount += 1
-            runtimeDefaults.set(calibrationPaddingRescueCount, forKey: RuntimeKeys.calibrationPaddingRescueCount)
-        } else {
-            trackingPaddingRescueCount += 1
-            runtimeDefaults.set(trackingPaddingRescueCount, forKey: RuntimeKeys.trackingPaddingRescueCount)
+        if diagnostics.detectedByPadding {
+            sessionFramesDetectedByPadding += 1
+            if let width = diagnostics.candidateShoulderWidth {
+                sessionDetectionShoulderWidths.append(width)
+                // Bound the buffer so a long session can't grow it without limit.
+                if sessionDetectionShoulderWidths.count > 300 {
+                    sessionDetectionShoulderWidths.removeFirst(sessionDetectionShoulderWidths.count - 300)
+                }
+            }
+        } else if diagnostics.fullFrameSucceeded {
+            // Padding found nothing (or was skipped) but full-frame did — this is
+            // exactly what the full-frame fallback buys us.
+            sessionFramesDetectedByFullFrame += 1
+        } else if !diagnostics.motionGateSkipped {
+            sessionFramesUndetected += 1
         }
 
-        setRuntime(diagnostics.candidateShoulderWidth, forKey: RuntimeKeys.paddingRescueLastShoulderWidth)
-        setRuntime(diagnostics.rescuePadFactor, forKey: RuntimeKeys.paddingRescueFactor)
+        // Publish a few times per second rather than every frame; these are a
+        // running overview, not per-frame telemetry, and avoid per-frame writes.
+        if sessionFramesProcessed % 15 == 0 {
+            publishSessionDiagnostics()
+        }
+    }
+
+    private func publishSessionDiagnostics() {
+        frameGate.lock()
+        let dropped = sessionFramesDropped
+        frameGate.unlock()
+
+        runtimeDefaults.set(sessionFramesProcessed, forKey: RuntimeKeys.sessionFramesProcessed)
+        runtimeDefaults.set(dropped, forKey: RuntimeKeys.sessionFramesDropped)
+        runtimeDefaults.set(sessionFramesVisionRan, forKey: RuntimeKeys.sessionFramesVisionRan)
+        runtimeDefaults.set(sessionFramesDetectedByPadding, forKey: RuntimeKeys.sessionFramesDetectedByPadding)
+        runtimeDefaults.set(sessionFramesDetectedByFullFrame, forKey: RuntimeKeys.sessionFramesDetectedByFullFrame)
+        runtimeDefaults.set(sessionFramesUndetected, forKey: RuntimeKeys.sessionFramesUndetected)
+
+        if !sessionDetectionShoulderWidths.isEmpty {
+            let sorted = sessionDetectionShoulderWidths.sorted()
+            setRuntime(sorted.first, forKey: RuntimeKeys.sessionDetectionShoulderWidthMin)
+            setRuntime(sorted[sorted.count / 2], forKey: RuntimeKeys.sessionDetectionShoulderWidthMedian)
+            setRuntime(sorted.last, forKey: RuntimeKeys.sessionDetectionShoulderWidthMax)
+        }
+
+        if let startedAt = sessionStartedAt {
+            setRuntime(startedAt, forKey: RuntimeKeys.sessionStartedAt)
+            let elapsed = Date().timeIntervalSince(startedAt)
+            if elapsed > 0 {
+                // Effective processed-frame rate. Read against the capture interval
+                // it shows whether analysis is keeping up or shedding frames.
+                setRuntime(Double(sessionFramesProcessed) / elapsed, forKey: RuntimeKeys.sessionProcessedFPS)
+            }
+        }
+    }
+
+    private func resetSessionDiagnostics() {
+        sessionStartedAt = nil
+        sessionFramesProcessed = 0
+        sessionFramesVisionRan = 0
+        sessionFramesDetectedByPadding = 0
+        sessionFramesDetectedByFullFrame = 0
+        sessionFramesUndetected = 0
+        sessionDetectionShoulderWidths = []
+        frameGate.lock()
+        sessionFramesDropped = 0
+        frameGate.unlock()
+        publishSessionDiagnostics()
     }
 
     private func recordTrackingDiagnostics(
@@ -1693,7 +1778,7 @@ final class AppState: ObservableObject {
     private func resetTrackingDebugDiagnostics() {
         trackingDebugFrames = []
         trackingDebugFrameNumber = 0
-        trackingPaddingRescueCount = 0
+        resetSessionDiagnostics()
         trackingDebugOrientationSweeps = []
         lastValidForensicFrame = nil
         pendingForensicCollapse = nil
@@ -2381,10 +2466,17 @@ final class AppState: ObservableObject {
         static let calibrationLastCandidateNeckDistance = "runtime.calibration.lastCandidate.neckDistance"
         static let calibrationLastCandidateScore = "runtime.calibration.lastCandidate.score"
         static let calibrationHeadAnchorSource = "runtime.calibration.headAnchorSource"
-        static let calibrationPaddingRescueCount = "runtime.calibration.paddingRescue.count"
-        static let trackingPaddingRescueCount = "runtime.tracking.paddingRescue.count"
-        static let paddingRescueLastShoulderWidth = "runtime.paddingRescue.lastShoulderWidth"
-        static let paddingRescueFactor = "runtime.paddingRescue.factor"
+        static let sessionStartedAt = "runtime.session.startedAt"
+        static let sessionFramesProcessed = "runtime.session.framesProcessed"
+        static let sessionFramesDropped = "runtime.session.framesDropped"
+        static let sessionFramesVisionRan = "runtime.session.framesVisionRan"
+        static let sessionFramesDetectedByPadding = "runtime.session.framesDetectedByPadding"
+        static let sessionFramesDetectedByFullFrame = "runtime.session.framesDetectedByFullFrame"
+        static let sessionFramesUndetected = "runtime.session.framesUndetected"
+        static let sessionDetectionShoulderWidthMin = "runtime.session.detectionShoulderWidth.min"
+        static let sessionDetectionShoulderWidthMedian = "runtime.session.detectionShoulderWidth.median"
+        static let sessionDetectionShoulderWidthMax = "runtime.session.detectionShoulderWidth.max"
+        static let sessionProcessedFPS = "runtime.session.processedFramesPerSecond"
         static let calibrationSeedCandidates = "runtime.calibration.seedCandidates"
         static let calibrationSeedAccepted = "runtime.calibration.seedAccepted"
         static let calibrationBodyObservationTotal = "runtime.calibration.bodyObservationTotal"

@@ -198,10 +198,13 @@ struct PostureFrameDiagnostics: Equatable {
     var motionGateFrameHash: String?
     var consecutiveFailureFrameCount: Int = 0
     var forcedVisionAttemptsSinceFailure: Int = 0
-    // Set when full-frame body pose missed the user but a zoomed-out (padded)
-    // retry recovered them. Lets the runtime probe measure how often the
-    // on-failure padding rescue fires and at what scale.
-    var bodyRescuedByPadding: Bool = false
+    // Per-frame body-detection outcome. Padding is the primary detector for the
+    // laptop framing where full-frame body pose almost always fails; full-frame
+    // runs only as a fallback when padding finds nothing. These let the session
+    // probe count detections by source.
+    var detectedByPadding: Bool = false   // padded (primary) path found the body
+    var fullFrameSucceeded: Bool = false  // full-frame path found the body
+    var fullFrameBodyFailed: Bool = false // full-frame path ran and found nothing
     var rescuePadFactor: Double?
     var orientationRetryBestOrientation: String?
     var orientationRetryBestValidCandidateCount: Int?
