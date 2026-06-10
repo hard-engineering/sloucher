@@ -509,7 +509,11 @@ private struct WebcamPreview: View {
 
                 VStack {
                     Spacer()
-                    HStack {
+                    HStack(alignment: .bottom) {
+                        // Camera source lives with the feed it controls: a chip on
+                        // the preview, balanced against the nudge indicators on the
+                        // right. Bottom edge avoids the top slouch banner.
+                        CameraSourceChip()
                         Spacer()
                         NudgeIndicators(
                             firing: appState.status == .slouching || appState.isNudgePreviewActive,
@@ -1538,6 +1542,102 @@ private struct ScoreRing: View {
         }
 
         return "Posture score \(score) of 100, \(band)"
+    }
+}
+
+// Camera-source picker as a chip on the preview. Reads as interactive (camera
+// glyph + active camera name + chevron over a translucent fill) and turns the
+// brand accent color when an iPhone/external camera is available but unused, so
+// first-time users discover they can switch to a better angle.
+private struct CameraSourceChip: View {
+    @EnvironmentObject private var appState: AppState
+
+    var body: some View {
+        Menu {
+            Picker("Camera", selection: cameraBinding) {
+                Text("Automatic").tag(String?.none)
+                ForEach(appState.availableCameras) { camera in
+                    Text(camera.name).tag(String?.some(camera.id))
+                }
+            }
+            .pickerStyle(.inline)
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "video.fill")
+                    .font(.system(size: 12))
+                Text(activeCameraName)
+                    .font(.system(size: 13))
+                    .lineLimit(1)
+                if highlighted {
+                    // White text everywhere; the cue is a quiet appended hint,
+                    // not a recolor of the camera name.
+                    Text("• iPhone available")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Color.white.opacity(0.6))
+                }
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 10))
+            }
+            .foregroundStyle(Color.white)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(RoundedRectangle(cornerRadius: 8).fill(Color.black.opacity(0.82)))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .strokeBorder(Color.white.opacity(0.4), lineWidth: 1)
+            )
+            .contentShape(Rectangle())
+        }
+        // The styled pill IS the menu label, so the whole pill is the click
+        // target. .button + .plain keeps it clickable while rendering the label
+        // exactly as styled — .borderlessButton recolored the text and dropped the
+        // fill, and a transparent overlay label had no hit area.
+        .menuStyle(.button)
+        .buttonStyle(.plain)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .shadow(color: .black.opacity(0.5), radius: 4, y: 1)
+        .help(helpText)
+    }
+
+    private var cameraBinding: Binding<String?> {
+        Binding(
+            get: { appState.settings.selectedCameraID },
+            set: { appState.selectCamera($0) }
+        )
+    }
+
+    private var activeCameraName: String {
+        if let id = appState.settings.selectedCameraID,
+           let camera = appState.availableCameras.first(where: { $0.id == id }) {
+            return camera.name
+        }
+        if let builtIn = appState.availableCameras.first(where: { !$0.isExternal }) {
+            return builtIn.name
+        }
+        return "Camera"
+    }
+
+    // Cue when an external/iPhone camera is connected but the feed is still on
+    // the built-in (or automatic) camera.
+    private var highlighted: Bool {
+        guard appState.availableCameras.contains(where: { $0.isExternal }) else { return false }
+        if let id = appState.settings.selectedCameraID,
+           let camera = appState.availableCameras.first(where: { $0.id == id }),
+           camera.isExternal {
+            return false
+        }
+        return true
+    }
+
+    private var helpText: String {
+        if let id = appState.settings.selectedCameraID,
+           let camera = appState.availableCameras.first(where: { $0.id == id }) {
+            return "Camera: \(camera.name). Click to change."
+        }
+        return highlighted
+            ? "An iPhone or external camera is available — click to use it"
+            : "Choose the camera Sloucher uses"
     }
 }
 
