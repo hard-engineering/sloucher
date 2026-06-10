@@ -10,11 +10,24 @@ enum CameraAuthorization: Equatable {
     case unavailable
 }
 
+// A selectable capture device for the camera picker (built-in, external, or an
+// iPhone via Continuity Camera). Identified by AVCaptureDevice.uniqueID.
+struct CameraDevice: Identifiable, Equatable, Hashable {
+    let id: String
+    let name: String
+    // True for an iPhone (Continuity) or other external camera, as opposed to
+    // the built-in one. Lets the UI cue when a better-angle camera is available.
+    let isExternal: Bool
+}
+
 final class CameraController: NSObject {
     var sampleIntervalProvider: () -> TimeInterval = { 1.5 }
     var onFrame: ((CMSampleBuffer) -> Void)?
     var onAuthorizationChange: ((CameraAuthorization) -> Void)?
     var onAuthorizationRequestFinished: (() -> Void)?
+    // Fired when capture devices are plugged/unplugged (incl. an iPhone becoming
+    // available as a Continuity Camera) so the UI list and selection can refresh.
+    var onDevicesChanged: (() -> Void)?
 
     private let session = AVCaptureSession()
     private let sessionQueue = DispatchQueue(label: "app.sloucher.camera.session")
@@ -26,6 +39,56 @@ final class CameraController: NSObject {
     private var lastFrameTime: CFTimeInterval = 0
     private var shouldForceNextFrame = false
     private var currentAuthorization: CameraAuthorization?
+    // uniqueID of the user-chosen camera; nil means automatic (built-in front).
+    private var preferredDeviceID: String?
+
+    override init() {
+        super.init()
+        // Use the stable underlying notification-name strings: the typed
+        // constants were renamed in macOS 15, but the names work across our 13+
+        // target without an availability split or a deprecation warning.
+        let center = NotificationCenter.default
+        center.addObserver(self, selector: #selector(handleDeviceChange),
+                           name: NSNotification.Name("AVCaptureDeviceWasConnected"), object: nil)
+        center.addObserver(self, selector: #selector(handleDeviceChange),
+                           name: NSNotification.Name("AVCaptureDeviceWasDisconnected"), object: nil)
+    }
+
+    @objc private func handleDeviceChange() {
+        onDevicesChanged?()
+    }
+
+    // Cameras the user can pick from: built-in, external, and (macOS 14+) an
+    // iPhone via Continuity Camera. Deduplicated by uniqueID.
+    static func availableCameras() -> [CameraDevice] {
+        var types: [AVCaptureDevice.DeviceType] = [.builtInWideAngleCamera]
+        if #available(macOS 14.0, *) {
+            types.append(.continuityCamera)
+            types.append(.external)
+        }
+        let discovery = AVCaptureDevice.DiscoverySession(
+            deviceTypes: types, mediaType: .video, position: .unspecified
+        )
+        var seen = Set<String>()
+        return discovery.devices.compactMap { device in
+            guard seen.insert(device.uniqueID).inserted else { return nil }
+            return CameraDevice(
+                id: device.uniqueID,
+                name: device.localizedName,
+                isExternal: device.deviceType != .builtInWideAngleCamera
+            )
+        }
+    }
+
+    // Set the preferred camera (nil = automatic). Swaps the live input if the
+    // session is already running and the resolved device actually changed.
+    func setPreferredDeviceID(_ id: String?) {
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            self.preferredDeviceID = id
+            self.applyPreferredDeviceIfNeeded()
+        }
+    }
 
     func refreshAuthorizationAndConfigureIfAllowed() {
         switch AVCaptureDevice.authorizationStatus(for: .video) {
@@ -88,6 +151,7 @@ final class CameraController: NSObject {
     }
 
     deinit {
+        NotificationCenter.default.removeObserver(self)
         videoOutput?.setSampleBufferDelegate(nil, queue: nil)
         sessionQueue.sync {
             if session.isRunning {
@@ -106,7 +170,7 @@ final class CameraController: NSObject {
                 return
             }
 
-            guard let device = Self.preferredVideoDevice() else {
+            guard let device = self.resolveVideoDevice() else {
                 self.updateAuthorization(.unavailable)
                 return
             }
@@ -195,9 +259,47 @@ final class CameraController: NSObject {
         onAuthorizationChange?(authorization)
     }
 
-    private static func preferredVideoDevice() -> AVCaptureDevice? {
-        AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front)
+    // Resolve the device to capture from: the user's pick if it's currently
+    // connected, otherwise fall back to the built-in front camera. The fallback
+    // keeps the app working when the chosen iPhone/external camera is unplugged.
+    private func resolveVideoDevice() -> AVCaptureDevice? {
+        if let preferredDeviceID, let device = AVCaptureDevice(uniqueID: preferredDeviceID) {
+            return device
+        }
+        return AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front)
             ?? AVCaptureDevice.default(for: .video)
+    }
+
+    // Swap the running session's input to the resolved device when it differs
+    // from what's currently attached. Runs on sessionQueue. Restores the previous
+    // input if the new one can't be added, so the session never ends up input-less.
+    private func applyPreferredDeviceIfNeeded() {
+        guard isConfigured else { return } // initial configureSession() uses resolveVideoDevice()
+        guard let target = resolveVideoDevice() else { return }
+
+        let currentID = session.inputs
+            .compactMap { ($0 as? AVCaptureDeviceInput)?.device.uniqueID }
+            .first
+        guard currentID != target.uniqueID else { return }
+        guard let newInput = try? AVCaptureDeviceInput(device: target) else { return }
+
+        session.beginConfiguration()
+        let previousInputs = session.inputs
+        previousInputs.forEach { session.removeInput($0) }
+        if session.canAddInput(newInput) {
+            session.addInput(newInput)
+        } else {
+            previousInputs.forEach { session.addInput($0) }
+        }
+        // The input changed, so its connection is new — re-assert unmirrored
+        // capture geometry for Vision.
+        if let connection = videoOutput?.connection(with: .video),
+           connection.isVideoMirroringSupported {
+            connection.automaticallyAdjustsVideoMirroring = false
+            connection.isVideoMirrored = false
+        }
+        session.commitConfiguration()
+        shouldForceNextFrame = true
     }
 }
 

@@ -25,6 +25,18 @@ final class SettingsStore: ObservableObject {
         didSet { defaults.set(paddingRescueEnabled, forKey: Keys.paddingRescueEnabled) }
     }
 
+    // uniqueID of the user-chosen camera; nil = automatic (built-in front).
+    // Lets the user route Sloucher to an iPhone via Continuity Camera.
+    @Published var selectedCameraID: String? {
+        didSet {
+            if let selectedCameraID {
+                defaults.set(selectedCameraID, forKey: Keys.selectedCameraID)
+            } else {
+                defaults.removeObject(forKey: Keys.selectedCameraID)
+            }
+        }
+    }
+
     @Published var baseline: PostureBaseline? {
         didSet { persistBaseline() }
     }
@@ -39,6 +51,7 @@ final class SettingsStore: ObservableObject {
         self.soundEnabled = defaults.object(forKey: Keys.soundEnabled) as? Bool ?? true
         self.overlayEnabled = defaults.object(forKey: Keys.overlayEnabled) as? Bool ?? true
         self.paddingRescueEnabled = defaults.object(forKey: Keys.paddingRescueEnabled) as? Bool ?? true
+        self.selectedCameraID = defaults.string(forKey: Keys.selectedCameraID)
         self.baseline = Self.loadBaseline(from: defaults)
         if self.baseline == nil {
             Self.clearPersistedBaseline(from: defaults)
@@ -112,6 +125,7 @@ final class SettingsStore: ObservableObject {
         static let soundEnabled = "soundEnabled"
         static let overlayEnabled = "overlayEnabled"
         static let paddingRescueEnabled = "paddingRescueEnabled"
+        static let selectedCameraID = "selectedCameraID"
         static let baselineNeckDistance = "baseline.neckDistance"
         static let baselineShoulderWidth = "baseline.shoulderWidth"
         static let baselineFaceCenterY = "baseline.faceCenterY"

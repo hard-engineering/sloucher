@@ -64,6 +64,8 @@ final class AppState: ObservableObject {
     @Published private(set) var detailText: String?
     @Published private(set) var cameraAuthorization: CameraAuthorization = .notDetermined
     @Published private(set) var hasCheckedCameraAuthorization = false
+    // Cameras the user can pick from (built-in, external, iPhone via Continuity).
+    @Published private(set) var availableCameras: [CameraDevice] = []
     @Published private(set) var notificationPermissionStatus: NotificationPermissionStatus = .notDetermined
     // True after the macOS permission prompt was closed without a decision.
     // A same-session re-request will not re-present the prompt, so the UI
@@ -617,6 +619,13 @@ final class AppState: ObservableObject {
             self?.processFrame(sampleBuffer)
         }
 
+        // Route capture to the user's chosen camera (nil = automatic built-in).
+        cameraController.setPreferredDeviceID(settings.selectedCameraID)
+        cameraController.onDevicesChanged = { [weak self] in
+            self?.handleCameraDevicesChanged()
+        }
+        refreshAvailableCameras()
+
         cameraController.onAuthorizationChange = { [weak self] authorization in
             DispatchQueue.main.async {
                 self?.applyCameraAuthorization(authorization)
@@ -636,6 +645,32 @@ final class AppState: ObservableObject {
         }
 
         powerManager.start()
+    }
+
+    // Set the active camera (nil = automatic). Persists the choice and switches
+    // the live feed; the choice is retained so it auto-resumes when an unplugged
+    // camera (e.g. an iPhone) reconnects.
+    func selectCamera(_ id: String?) {
+        settings.selectedCameraID = id
+        cameraController.setPreferredDeviceID(id)
+    }
+
+    func refreshAvailableCameras() {
+        let cameras = CameraController.availableCameras()
+        if Thread.isMainThread {
+            availableCameras = cameras
+        } else {
+            DispatchQueue.main.async { [weak self] in self?.availableCameras = cameras }
+        }
+    }
+
+    private func handleCameraDevicesChanged() {
+        // A camera connected/disconnected (e.g. iPhone Continuity Camera): refresh
+        // the pickable list and re-resolve the preferred device so the live feed
+        // follows the user's choice — switch to it when it appears, fall back to
+        // built-in when it's unplugged.
+        refreshAvailableCameras()
+        cameraController.setPreferredDeviceID(settings.selectedCameraID)
     }
 
     private func configureSettingsObservation() {
@@ -1315,6 +1350,8 @@ final class AppState: ObservableObject {
             detailText = "Starting camera."
             publishRuntimeDiagnostics(status: status, detail: detailText, metrics: nil)
             startCameraIfAllowed()
+            // Devices (esp. Continuity Camera) are only enumerable once authorized.
+            refreshAvailableCameras()
             onCameraPermissionSatisfied?()
         case .denied:
             stopCamera()
